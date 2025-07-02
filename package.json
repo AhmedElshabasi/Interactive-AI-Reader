@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "pdfjs-dist": "^5.3.31",
+    "react-pdf": "^9.2.1",
+    "react-pdf-highlighter": "^8.0.0-rc.0"
+  }
+}
