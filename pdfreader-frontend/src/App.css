@@ -1,9 +1,5 @@
 .App {
   text-align: center;
-  position: relative; /* <-- Add this line */
-  height: 100vh;      /* Ensure it fills the viewport */
-  width: 100vw;
-  overflow: hidden;   /* Optional: prevents scrollbars from accidental overflow */
 }
 
 .App-logo {
