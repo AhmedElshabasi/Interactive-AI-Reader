@@ -1,35 +1,13 @@
-import React, { useEffect } from 'react';
+import React from 'react';
+import PdfViewer from './PdfViewer';
 import './App.css';
 
-const pdfUrl = 'sample.pdf';
-console.log(pdfUrl);
-const viewerUrl = `http://localhost:55988/web/viewer.html?file=${encodeURIComponent(pdfUrl)}`;
-
 function App() {
-  useEffect(() => {
-    function handleMessage(event) {
-      console.log('Received postMessage event:', event); // Debugging message
-      if (event.data?.type === 'pdf-text-selected') {
-        const selectedText = event.data.text;
-        console.log('Selected text from PDF.js:', selectedText);
-        // Here you can abort TTS and start reading from selectedText
-      }
-    }
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, []);
-
   return (
     <div className="App">
-      <h2>PDF.js Viewer</h2>
-      <iframe
-        title="PDF.js Viewer"
-        src={viewerUrl}
-        width="100%"
-        height="900px"
-        style={{ border: 'none' }}
-        onLoad={() => console.log('PDF.js iframe loaded!')}
-      />
+      <h1>I hope you see the vision (cause I still don't)</h1>
+      {/* You can replace the URL below with any PDF file you want to display */}
+      <PdfViewer fileUrl="/sample2.pdf" />
     </div>
   );
 }
