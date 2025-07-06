@@ -79,16 +79,194 @@ export default function PdfViewer({ fileUrl }) {
     return spans;
   }
 
+  // Collect text chunks (paragraphs) from a starting position
+  function collectTextChunks(startSpan, maxParagraphs = 5) {
+    const chunks = [];
+    let currentSpan = startSpan;
+    let paragraphCount = 0;
+    let currentChunk = [];
+    
+    while (currentSpan && paragraphCount < maxParagraphs) {
+      const text = currentSpan.textContent.trim();
+      
+      if (text.length > 0) {
+        currentChunk.push({
+          element: currentSpan,
+          text: text
+        });
+        
+        // Check if this span ends a paragraph (ends with sentence ending)
+        if (isEndOfParagraph(currentSpan)) {
+          // Finalize current chunk
+          if (currentChunk.length > 0) {
+            chunks.push({
+              spans: [...currentChunk],
+              rawText: currentChunk.map(s => s.text).join(' '),
+              paragraphNumber: paragraphCount + 1
+            });
+            currentChunk = [];
+            paragraphCount++;
+          }
+        }
+      }
+      
+      currentSpan = getNextSpanGlobal(currentSpan);
+    }
+    
+    // Add any remaining text as the last chunk
+    if (currentChunk.length > 0) {
+      chunks.push({
+        spans: currentChunk,
+        rawText: currentChunk.map(s => s.text).join(' '),
+        paragraphNumber: paragraphCount + 1
+      });
+    }
+    
+    return chunks;
+  }
+
+  // Check if a span ends a paragraph
+  function isEndOfParagraph(spanElement) {
+    if (!spanElement) return false;
+    
+    const text = spanElement.textContent.trim();
+    const rect = spanElement.getBoundingClientRect();
+    const nextSpan = getNextSpanGlobal(spanElement);
+    
+    if (!nextSpan) return false;
+    
+    const nextRect = nextSpan.getBoundingClientRect();
+    const nextText = nextSpan.textContent.trim();
+    
+    // Method 1: Check for double line breaks or significant spacing
+    const verticalGap = nextRect.top - rect.bottom;
+    
+    // If there's a significant vertical gap (> 1.5x line height), it's likely a new paragraph
+    if (verticalGap > rect.height * 1.5) {
+      return true;
+    }
+    
+    // Method 2: Check for paragraph indentation (first line of paragraph)
+    const currentPage = spanElement.closest('.react-pdf__Page');
+    const pageRect = currentPage?.getBoundingClientRect();
+    
+    if (pageRect) {
+      const currentLeftMargin = rect.left - pageRect.left;
+      const nextLeftMargin = nextRect.left - pageRect.left;
+      
+      // If next span is significantly more indented, it's likely a new paragraph
+      if (nextLeftMargin > currentLeftMargin + 20) {
+        return true;
+      }
+    }
+    
+    // Method 3: Check for common paragraph break patterns
+    const paragraphStarters = [
+      /^[A-Z][a-z]+:/,  // "Chapter:", "Section:", etc.
+      /^\d+\./,         // "1.", "2.", etc.
+      /^[A-Z][A-Z\s]+$/, // ALL CAPS headers
+      /^[A-Z][a-z]+\s+[A-Z][a-z]+:/, // "Chapter One:", etc.
+    ];
+    
+    for (const pattern of paragraphStarters) {
+      if (pattern.test(nextText)) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  // Process text chunks through ChatGPT for cleaning
+  async function processTextChunks(chunks) {
+    // Combine all chunks into one large text block
+    const combinedText = chunks.map(chunk => chunk.rawText).join('\n\n');
+    
+    try {
+      // Send the entire combined text to ChatGPT for cleaning
+      const cleanedText = await sendToChatGPT(combinedText);
+      
+      console.log(`Processed ${chunks.length} paragraphs together:`, cleanedText);
+      
+      // Return all chunks with the same cleaned text
+      return chunks.map(chunk => ({
+        ...chunk,
+        cleanedText: cleanedText,
+        readyForTTS: true
+      }));
+      
+    } catch (error) {
+      console.error('Error processing chunks:', error);
+      // Fallback to raw text if ChatGPT fails
+      return chunks.map(chunk => ({
+        ...chunk,
+        cleanedText: chunk.rawText,
+        readyForTTS: true
+      }));
+    }
+  }
+
+  // Send text to ChatGPT for cleaning (simulated for now)
+  async function sendToChatGPT(text) {
+    // Simulate API call delay
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // This is where you'd make the actual ChatGPT API call
+    // For now, just return a cleaned version
+    return `[Cleaned by ChatGPT] ${text}`;
+    
+    // Real implementation would be something like:
+    /*
+    const response = await fetch('/api/chatgpt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: `Clean and format this text for text-to-speech reading. Make it flow naturally and fix any formatting issues: ${text}`,
+        max_tokens: 1000
+      })
+    });
+    
+    const data = await response.json();
+    return data.choices[0].text.trim();
+    */
+  }
+
   // Process text spans for TTS (this is where you'd send to ChatGPT API)
   async function processTextForTTS(spans) {
-    // Simulate processing time
-    await new Promise(resolve => setTimeout(resolve, 100));
+    // Instead of processing individual spans, collect them into chunks
+    const chunks = collectTextChunks(spans[0]?.element, 5); // 5 paragraphs
+    const processedChunks = await processTextChunks(chunks);
     
-    return spans.map(span => ({
-      ...span,
-      processedText: `Processed: ${span.text}`, // This would be ChatGPT's response
-      readyForTTS: true
-    }));
+    // Convert chunks back to span format for compatibility
+    const processedSpans = [];
+    
+    for (const chunk of processedChunks) {
+      // Add the cleaned text to the first span of each chunk
+      if (chunk.spans.length > 0) {
+        processedSpans.push({
+          ...chunk.spans[0],
+          processedText: chunk.cleanedText,
+          readyForTTS: true,
+          isChunkStart: true,
+          chunkSize: chunk.spans.length,
+          chunkIndex: 0
+        });
+        
+        // Add remaining spans as continuation (no additional processing)
+        for (let i = 1; i < chunk.spans.length; i++) {
+          processedSpans.push({
+            ...chunk.spans[i],
+            processedText: '', // Empty for continuation spans
+            readyForTTS: false, // Don't read these individually
+            isChunkStart: false,
+            chunkSize: chunk.spans.length,
+            chunkIndex: i
+          });
+        }
+      }
+    }
+    
+    return processedSpans;
   }
 
   // Load more text into buffer when needed
@@ -172,12 +350,32 @@ export default function PdfViewer({ fileUrl }) {
       const currentSpan = readingQueue.current.shift();
       if (!currentSpan) break;
       
+      // Skip spans that are not meant to be read individually
+      if (!currentSpan.readyForTTS) {
+        continue;
+      }
+      
       // Highlight current span being read
       console.log("highlighting span", currentSpan.element);
       highlightSpan(currentSpan.element);
       
-      // Simulate TTS reading (replace with actual TTS)
-      await simulateTTSReading(currentSpan.text);
+      // If this is a chunk start, read the entire cleaned text
+      if (currentSpan.isChunkStart) {
+        await simulateTTSReading(currentSpan.processedText);
+        
+        // Skip the remaining spans in this chunk
+        for (let i = 0; i < currentSpan.chunkSize - 1; i++) {
+          if (readingQueue.current.length > 0) {
+            const skipSpan = readingQueue.current.shift();
+            // Still highlight them briefly for visual feedback
+            highlightSpan(skipSpan.element);
+            setTimeout(() => removeHighlight(skipSpan.element), 100);
+          }
+        }
+      } else {
+        // Regular span reading (fallback)
+        await simulateTTSReading(currentSpan.text);
+      }
       
       // Remove highlight
       removeHighlight(currentSpan.element);
