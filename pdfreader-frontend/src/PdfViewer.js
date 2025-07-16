@@ -10,6 +10,7 @@ export default function PdfViewer({ fileUrl }) {
   const [numPages, setNumPages] = useState(null);
   const [isReading, setIsReading] = useState(false);
   const [currentReadingPosition, setCurrentReadingPosition] = useState(null);
+  const [theme, setTheme] = useState('dark'); // Add theme state, default to dark
   
   // Buffer management for continuous reading
   const textBuffer = useRef([]);
@@ -206,30 +207,34 @@ export default function PdfViewer({ fileUrl }) {
     }
   }
 
-  // Send text to ChatGPT for cleaning (simulated for now)
   async function sendToChatGPT(text) {
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // This is where you'd make the actual ChatGPT API call
-    // For now, just return a cleaned version
-    return `[Cleaned by ChatGPT] ${text}`;
-    
-    // Real implementation would be something like:
-    /*
-    const response = await fetch('/api/chatgpt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt: `Clean and format this text for text-to-speech reading. Make it flow naturally and fix any formatting issues: ${text}`,
-        max_tokens: 1000
-      })
-    });
-    
-    const data = await response.json();
-    return data.choices[0].text.trim();
-    */
+    console.log("Sending text to ChatGPT:", text);
+    try {
+      const response = await fetch('http://localhost:8000/api/chatgpt/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          prompt: `Clean and format this text for text-to-speech reading. Make it flow naturally and fix any formatting issues:\n\n${text}`,
+          max_tokens: 1000
+        })
+      });
+  
+      const data = await response.json();
+  
+      if (data.choices && data.choices.length > 0) {
+        return data.choices[0].message.content.trim();  // <-- KEY CHANGE
+      } else {
+        console.error('Unexpected response from ChatGPT API:', data);
+        return '[Error] Could not process text';
+      }
+    } catch (error) {
+      console.error('Error sending request to Django API:', error);
+      return '[Error] Failed to contact ChatGPT backend';
+    }
   }
+  
 
   // Process text spans for TTS (this is where you'd send to ChatGPT API)
   async function processTextForTTS(spans) {
@@ -450,9 +455,28 @@ export default function PdfViewer({ fileUrl }) {
     isReadingRef.current = isReading;
   }, [isReading]);
 
+  useEffect(() => {
+    document.body.className = theme + '-mode';
+    document.documentElement.className = theme + '-mode';
+  }, [theme]);
+
   return (
-    <div>
+    <div className={theme === 'dark' ? 'dark-mode' : 'light-mode'}>
       <div style={{ marginBottom: '10px' }}>
+        <button
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          style={{
+            padding: '8px 16px',
+            backgroundColor: theme === 'dark' ? '#333' : '#eee',
+            color: theme === 'dark' ? '#fff' : '#222',
+            border: 'none',
+            borderRadius: '4px',
+            marginRight: '10px',
+            cursor: 'pointer'
+          }}
+        >
+          Switch to {theme === 'dark' ? 'Light' : 'Dark'} Mode
+        </button>
         <button 
           onClick={stopReading} 
           disabled={!isReading}

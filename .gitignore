@@ -3,3 +3,4 @@ node_modules
 dist
 pdfreader-frontend/public/pdfjs/
 __pycache__/
+**/.env

@@ -36,3 +36,44 @@
     transform: rotate(360deg);
   }
 }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.dark-mode, .light-mode {
+  min-height: 100vh;
+  min-height: 100dvh;
+  width: 100vw;
+  box-sizing: border-box;
+}
+
+body.dark-mode, html.dark-mode {
+  background-color: #181818 !important;
+  color: #f1f1f1 !important;
+}
+
+body.light-mode, html.light-mode {
+  background-color: #fff !important;
+  color: #222 !important;
+}
+
+.dark-mode .react-pdf__Page__textContent {
+  color: #f1f1f1;
+  background: transparent;
+}
+.light-mode .react-pdf__Page__textContent {
+  color: #222;
+  background: transparent;
+}
+
+.dark-mode .react-pdf__Page__canvas {
+  filter: invert(0.92) hue-rotate(180deg) brightness(0.9);
+  background: #222;
+}
+.light-mode .react-pdf__Page__canvas {
+  filter: none;
+  background: #fff;
+}
