@@ -11,6 +11,8 @@ export default function PdfViewer({ fileUrl }) {
   const [isReading, setIsReading] = useState(false);
   const [currentReadingPosition, setCurrentReadingPosition] = useState(null);
   const [theme, setTheme] = useState('dark'); // Add theme state, default to dark
+  const [currentPage, setCurrentPage] = useState(1); // Track current page
+  const [pageInput, setPageInput] = useState(1); // For input form
   
   // Buffer management for continuous reading
   const textBuffer = useRef([]);
@@ -460,6 +462,72 @@ export default function PdfViewer({ fileUrl }) {
     document.documentElement.className = theme + '-mode';
   }, [theme]);
 
+  // Handler for when a page is rendered
+  function onPageRender(pageNumber) {
+    setCurrentPage(pageNumber);
+  }
+
+  // Helper to handle visible page on scroll
+  function handleScroll(e) {
+    const container = e.target;
+    const pages = container.querySelectorAll('.react-pdf__Page');
+    let found = false;
+    for (let i = 0; i < pages.length; i++) {
+      const rect = pages[i].getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      if (rect.bottom > containerRect.top + 50) { // 50px offset for header
+        setCurrentPage(i + 1);
+        found = true;
+        break;
+      }
+    }
+    if (!found && pages.length > 0) {
+      setCurrentPage(pages.length);
+    }
+  }
+
+  // Attach scroll handler to pdf-container
+  useEffect(() => {
+    const container = document.querySelector('.pdf-container');
+    if (container) {
+      container.addEventListener('scroll', handleScroll);
+      return () => container.removeEventListener('scroll', handleScroll);
+    }
+  }, [numPages]);
+
+  // Scroll to a specific page
+  function goToPage(pageNum) {
+    const container = document.querySelector('.pdf-container');
+    const pages = container?.querySelectorAll('.react-pdf__Page');
+    if (pages && pages.length > 0 && pageNum >= 1 && pageNum <= pages.length) {
+      const pageElem = pages[pageNum - 1];
+      if (pageElem && pageElem.scrollIntoView) {
+        pageElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        setCurrentPage(pageNum);
+        setPageInput(pageNum);
+      }
+    }
+  }
+
+  // Update input when currentPage changes (e.g., on scroll)
+  useEffect(() => {
+    setPageInput(currentPage);
+  }, [currentPage]);
+
+  // Handle input change
+  function handleInputChange(e) {
+    const val = e.target.value.replace(/[^0-9]/g, '');
+    setPageInput(val ? parseInt(val) : '');
+  }
+
+  // Handle Go button or Enter key
+  function handleGo(e) {
+    e.preventDefault();
+    if (pageInput >= 1 && pageInput <= numPages) {
+      goToPage(pageInput);
+    }
+  }
+
   return (
     <div className={theme === 'dark' ? 'dark-mode' : 'light-mode'}>
       <div style={{ marginBottom: '10px' }}>
@@ -497,16 +565,53 @@ export default function PdfViewer({ fileUrl }) {
           </span>
         )}
       </div>
-      
-      <Document file={fileUrl} onLoadSuccess={onDocumentLoadSuccess}>
-        {Array.from(new Array(numPages), (el, index) => (
-          <Page
-            key={`page_${index + 1}`}
-            pageNumber={index + 1}
-            renderAnnotationLayer={false}
+      <div className="pdf-container">
+        <form className="page-overlay" onSubmit={handleGo}>
+          <label htmlFor="page-input" style={{ marginRight: 8 }}>Page</label>
+          <input
+            id="page-input"
+            type="number"
+            min={1}
+            max={numPages || 1}
+            value={pageInput}
+            onChange={handleInputChange}
+            style={{
+              width: 60,
+              padding: '4px 8px',
+              borderRadius: 8,
+              border: '1px solid #888',
+              marginRight: 8,
+              fontSize: '1rem',
+              textAlign: 'center',
+              background: 'rgba(255,255,255,0.9)'
+            }}
           />
-        ))}
-      </Document>
+          <span style={{ marginRight: 8 }}>/ {numPages || 1}</span>
+          <button
+            type="submit"
+            style={{
+              padding: '4px 12px',
+              borderRadius: 8,
+              border: 'none',
+              background: '#444',
+              color: '#fff',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+              fontSize: '1rem'
+            }}
+          >Go</button>
+        </form>
+        <Document file={fileUrl} onLoadSuccess={onDocumentLoadSuccess}>
+          {Array.from(new Array(numPages), (el, index) => (
+            <Page
+              key={`page_${index + 1}`}
+              pageNumber={index + 1}
+              renderAnnotationLayer={false}
+              onRenderSuccess={() => onPageRender(index + 1)}
+            />
+          ))}
+        </Document>
+      </div>
     </div>
   );
 } 
