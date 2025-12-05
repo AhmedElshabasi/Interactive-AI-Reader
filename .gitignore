@@ -4,3 +4,10 @@ dist
 pdfreader-frontend/public/pdfjs/
 __pycache__/
 **/.env
+howToRun.txt
+run.bat
+ARCHITECTURE.md
+STREAMING_TTS_GUIDE.md
+PIPER_TTS_SETUP.md
+en_US-ryan-high.onnx
+en_US-ryan-high.onnx.json
