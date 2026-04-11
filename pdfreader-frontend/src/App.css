@@ -36,3 +36,67 @@
     transform: rotate(360deg);
   }
 }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.dark-mode, .light-mode {
+  min-height: 100vh;
+  min-height: 100dvh;
+  width: 100vw;
+  box-sizing: border-box;
+}
+
+body.dark-mode, html.dark-mode {
+  background-color: #181818 !important;
+  color: #f1f1f1 !important;
+}
+
+body.light-mode, html.light-mode {
+  background-color: #fff !important;
+  color: #222 !important;
+}
+
+.dark-mode .react-pdf__Page__textContent {
+  color: #f1f1f1;
+  background: transparent;
+}
+.light-mode .react-pdf__Page__textContent {
+  color: #222;
+  background: transparent;
+}
+
+.dark-mode .react-pdf__Page__canvas {
+  filter: invert(0.92) hue-rotate(180deg) brightness(0.9);
+  background: #222;
+}
+.light-mode .react-pdf__Page__canvas {
+  filter: none;
+  background: #fff;
+}
+
+
+.pdf-container {
+  display: flex;
+  justify-content: center;
+  height: calc(100vh - 60px); /* adjust as needed */
+  overflow-y: scroll;
+  box-sizing: border-box;
+  position: relative;
+}
+
+.page-overlay {
+  position: fixed;
+  top: 16px;
+  right: 32px;
+  background: rgba(30, 30, 30, 0.7);
+  color: #fff;
+  padding: 8px 18px;
+  border-radius: 20px;
+  font-size: 1.1rem;
+  z-index: 1000;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
