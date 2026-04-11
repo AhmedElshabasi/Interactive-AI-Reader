@@ -29,9 +29,85 @@ export default function PdfViewer({ fileUrl }) {
   const ttsAbortRef = useRef(null);
   const audioObjectUrlRef = useRef(null);
 
+  const DEBUG_TTS = true;
+  const dbg = (...args) => DEBUG_TTS && console.log(...args);
+
   function onDocumentLoadSuccess({ numPages }) {
     setNumPages(numPages);
   }
+
+  function splitIntoSentences(text) {
+  const t = (text || "").trim();
+  if (!t) return [];
+
+  // Best option: Intl.Segmenter (modern browsers)
+  if (typeof Intl !== "undefined" && Intl.Segmenter) {
+    const seg = new Intl.Segmenter("en", { granularity: "sentence" });
+    return Array.from(seg.segment(t))
+      .map(s => s.segment.trim())
+      .filter(Boolean);
+  }
+
+  // Fallback (simple, decent)
+  const parts = t.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+  return parts.map(s => s.trim()).filter(Boolean);
+}
+
+function buildRawTextAndSpanRanges(spans) {
+  // rawText MUST match how you combined it earlier: join with spaces
+  let rawText = "";
+  const ranges = [];
+
+  for (let i = 0; i < spans.length; i++) {
+    const piece = (spans[i]?.text || "").trim();
+    if (!piece) continue;
+
+    const prefix = rawText.length === 0 ? "" : " ";
+    const start = rawText.length + prefix.length;
+    rawText += prefix + piece;
+    const end = rawText.length; // end is exclusive
+    ranges.push({ element: spans[i].element, start, end });
+  }
+
+  return { rawText, ranges };
+}
+
+function sentenceOffsets(text) {
+  const t = (text || "");
+  if (!t) return [];
+
+  if (typeof Intl !== "undefined" && Intl.Segmenter) {
+    const seg = new Intl.Segmenter("en", { granularity: "sentence" });
+    return Array.from(seg.segment(t))
+      .map(s => ({ start: s.index, end: s.index + s.segment.length, text: s.segment }))
+      .filter(s => s.text.trim().length > 0);
+  }
+
+  // Fallback offsets (approx)
+  const parts = splitIntoSentences(t);
+  let cursor = 0;
+  return parts.map(p => {
+    const start = t.indexOf(p, cursor);
+    const end = start + p.length;
+    cursor = end;
+    return { start, end, text: p };
+  });
+}
+
+function buildSentenceSpanGroups(rawText, spanRanges) {
+  const offsets = sentenceOffsets(rawText);
+  if (offsets.length === 0) return [];
+
+  return offsets.map(({ start, end }) => {
+    // spans whose ranges overlap this sentence range
+    const group = spanRanges
+      .filter(r => r.end > start && r.start < end)
+      .map(r => r.element);
+
+    return group;
+  });
+}
+
 
   // Initialize a single Audio instance
   useEffect(() => {
@@ -285,7 +361,96 @@ export default function PdfViewer({ fileUrl }) {
     });
   }
 
+ async function fetchPiperBlob(text, signal, meta = {}) {
+  const cleaned = (text || "").trim();
+  if (!cleaned) return null;
+
+  const id = meta.id ?? "?";
+  const i = meta.i ?? "?";
+  const t0 = performance.now();
+
+  dbg(`🎛️ [TTS FETCH START] chunk=${id} sent=${i} chars=${cleaned.length}`);
+  dbg(`🗣️ [SENTENCE TEXT] chunk=${id} sent=${i} ->`, cleaned);
+
+  const res = await fetch(`${API_BASE}/tts/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: cleaned }),
+    signal,
+  });
+
+  const t1 = performance.now();
+  dbg(`📡 [TTS FETCH RESP ] chunk=${id} sent=${i} status=${res.status} (${Math.round(t1 - t0)}ms)`);
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`TTS failed (${res.status}): ${errText || "Unknown error"}`);
+  }
+
+  const blob = await res.blob();
+  const t2 = performance.now();
+  dbg(`📦 [TTS BLOB READY] chunk=${id} sent=${i} bytes=${blob.size} (${Math.round(t2 - t0)}ms total)`);
+
+  return blob;
+}
+
+
+async function playBlob(blob, meta = {}) {
+  if (!blob || !audioRef.current) return;
+
+  const id = meta.id ?? "?";
+  const i = meta.i ?? "?";
+
+  if (audioObjectUrlRef.current) {
+    URL.revokeObjectURL(audioObjectUrlRef.current);
+    audioObjectUrlRef.current = null;
+  }
+
+  const url = URL.createObjectURL(blob);
+  audioObjectUrlRef.current = url;
+
+  await new Promise((resolve, reject) => {
+    const audio = audioRef.current;
+    const t0 = performance.now();
+
+    const onEnded = () => {
+      dbg(`✅ [PLAY ENDED] chunk=${id} sent=${i} played_ms=${Math.round(performance.now() - t0)}`);
+      cleanup(resolve);
+    };
+
+    const onError = (e) => {
+      dbg(`❌ [PLAY ERROR] chunk=${id} sent=${i}`, e);
+      cleanup(() => reject(e));
+    };
+
+    const cleanup = (cb) => {
+      try {
+        audio.removeEventListener("ended", onEnded);
+        audio.removeEventListener("error", onError);
+      } catch {}
+      cb();
+    };
+
+    try {
+      audio.src = url;
+      audio.addEventListener("ended", onEnded);
+      audio.addEventListener("error", onError);
+
+      dbg(`▶️ [PLAY START] chunk=${id} sent=${i} blob_bytes=${blob.size}`);
+
+      const p = audio.play();
+      if (p?.catch) p.catch((e) => cleanup(() => reject(e)));
+    } catch (e) {
+      cleanup(() => reject(e));
+    }
+  });
+}
+
+
+
   function stopAudioNow() {
+    dbg("🛑 stopAudioNow(): aborting fetch + stopping audio");
+
     try {
       if (ttsAbortRef.current) ttsAbortRef.current.abort();
     } catch {}
@@ -307,52 +472,60 @@ export default function PdfViewer({ fileUrl }) {
     } catch {}
   }
 
-  // Process text spans for TTS: collect ~5 paragraphs, clean once, and attach to the first span
-  async function processTextForTTS(spans) {
-    const startEl = spans?.[0]?.element;
-    if (!startEl) return spans || [];
 
-    const chunks = collectTextChunks(startEl, 5);
-    const combinedText = chunks.map((c) => c.rawText).join("\n\n");
+ async function processTextForTTS(spans) {
+  const startEl = spans?.[0]?.element;
+  if (!startEl) return spans || [];
 
-    let cleanedText = combinedText;
-    try {
-      cleanedText = await sendToChatGPT(combinedText);
-    } catch {
-      cleanedText = combinedText;
-    }
+  // collectTextChunks returns [{spans:[{element,text}...], rawText: "..."}...]
+  const chunks = collectTextChunks(startEl, 5);
 
-    // Flatten all spans included in these chunks into one big “read unit”
-    const allChunkSpans = chunks.flatMap((c) => c.spans);
+  // Flatten all spans we are treating as one “chunk”
+  const allChunkSpans = chunks.flatMap(c => c.spans);
+  if (allChunkSpans.length === 0) return spans || [];
 
-    if (allChunkSpans.length === 0) return spans || [];
+  // Raw text (original) and sentence -> span mapping (for highlighting)
+  const { rawText, ranges } = buildRawTextAndSpanRanges(allChunkSpans);
+  const rawSentenceSpanGroups = buildSentenceSpanGroups(rawText, ranges);
 
-    const processedSpans = [];
-
-    // First span carries the cleaned text and is what we actually speak
-    processedSpans.push({
-      ...allChunkSpans[0],
-      processedText: cleanedText,
-      readyForTTS: true,
-      isChunkStart: true,
-      chunkSize: allChunkSpans.length,
-      chunkIndex: 0,
-    });
-
-    // Rest are “continuations” that we visually highlight/skip
-    for (let i = 1; i < allChunkSpans.length; i++) {
-      processedSpans.push({
-        ...allChunkSpans[i],
-        processedText: "",
-        readyForTTS: false,
-        isChunkStart: false,
-        chunkSize: allChunkSpans.length,
-        chunkIndex: i,
-      });
-    }
-
-    return processedSpans;
+  // Cleaned text (ChatGPT) and sentence list (for Piper speech)
+  let cleanedText = rawText;
+  try {
+    cleanedText = await sendToChatGPT(rawText);
+  } catch {
+    cleanedText = rawText;
   }
+  const cleanedSentences = splitIntoSentences(cleanedText);
+
+  // Put everything onto the first span (the “chunk start”)
+  const processedSpans = [];
+
+  processedSpans.push({
+    ...allChunkSpans[0],
+    readyForTTS: true,
+    isChunkStart: true,
+    chunkSize: allChunkSpans.length,
+
+    // NEW payload:
+    rawText,
+    cleanedText,
+    cleanedSentences,
+    rawSentenceSpanGroups,
+  });
+
+  // Continuations (not individually spoken)
+  for (let i = 1; i < allChunkSpans.length; i++) {
+    processedSpans.push({
+      ...allChunkSpans[i],
+      readyForTTS: false,
+      isChunkStart: false,
+      chunkSize: allChunkSpans.length,
+    });
+  }
+
+  return processedSpans;
+}
+
 
   async function loadMoreTextIntoBuffer() {
     if (isLoadingMore.current) return;
@@ -425,28 +598,89 @@ export default function PdfViewer({ fileUrl }) {
 
       try {
         if (currentSpan.isChunkStart) {
-          // Pull the rest of this chunk off the queue now
-          const chunkItems = [currentSpan];
+          // Remove the rest of the chunk items from queue (we handle it internally)
           for (let i = 0; i < currentSpan.chunkSize - 1; i++) {
-            const next = readingQueue.current.shift();
-            if (!next) break;
-            chunkItems.push(next);
+            readingQueue.current.shift();
           }
 
-          // Highlight the whole chunk while audio plays
-          chunkItems.forEach(item => highlightSpan(item.element));
+          const cleanedSentences = currentSpan.cleanedSentences || [];
+          const groups = currentSpan.rawSentenceSpanGroups || [];
 
-          console.log("[Speaking chunk]", {
-            chunkSize: chunkItems.length,
-            chars: (currentSpan.processedText || "").length,
-            preview: (currentSpan.processedText || "").slice(0, 200),
-          });
+          // IMPORTANT: speak ALL cleaned sentences, even if we can't highlight all of them
+          const nSpeak = cleanedSentences.length;
+          const nHighlight = groups.length;
 
-          await speakWithPiper(currentSpan.processedText);
+          const chunkId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-          // Remove highlights after playback ends
-          chunkItems.forEach(item => removeHighlight(item.element));
-        } else {
+          dbg(`\n==================== 🔊 START CHUNK ${chunkId} ====================`);
+          dbg(`Counts: cleanedSentences=${nSpeak}, rawSentenceGroups(highlight)=${nHighlight}, chunkSpans=${currentSpan.chunkSize}`);
+          if (nSpeak !== nHighlight) {
+            dbg(`⚠️ MISMATCH: will SPEAK ${nSpeak} sentences; will HIGHLIGHT up to ${nHighlight} sentences (missing highlights are expected).`);
+          }
+          dbg("===============================================================\n");
+
+          const controller = new AbortController();
+          ttsAbortRef.current = controller;
+
+          // Prefetch more aggressively to reduce “midway pause”
+          const prefetchWindow = 8;
+
+          // Store promises so they begin fetching as soon as assigned
+          const audioPromises = new Array(nSpeak);
+
+          const startPrefetch = (i) => {
+            if (i < 0 || i >= nSpeak) return;
+            if (audioPromises[i]) return;
+            audioPromises[i] = fetchPiperBlob(cleanedSentences[i], controller.signal, { id: chunkId, i });
+          };
+
+          // Prime pipeline
+          for (let i = 0; i < nSpeak; i++) startPrefetch(i);
+
+          const startupBufferCount = 4; // tweak: 3–6 is typical
+          dbg(`⏳ [STARTUP BUFFER] waiting for first ${startupBufferCount} sentences to be ready...`);
+
+          const startupWaits = [];
+          for (let i = 0; i < Math.min(startupBufferCount, nSpeak); i++) {
+            startupWaits.push(audioPromises[i]);
+          }
+          await Promise.all(startupWaits);
+
+          dbg(`✅ [STARTUP BUFFER] ready, starting playback`);
+
+
+          for (let i = 0; i < nSpeak; i++) {
+            if (!isReadingRef.current) {
+              dbg(`🛑 [STOPPED] chunk=${chunkId} at sentence=${i}`);
+              break;
+            }
+
+            // keep prefetching ahead
+            startPrefetch(i + prefetchWindow);
+
+            // Highlight if possible
+            const spanGroup = groups[i] || [];
+            dbg(`✨ [HIGHLIGHT] chunk=${chunkId} sent=${i} spans=${spanGroup.length}`);
+            spanGroup.forEach((el) => highlightSpan(el));
+
+            dbg(`⏳ [NEED SENTENCE] i=${i} pending=${audioPromises.filter(Boolean).length}/${nSpeak}`);
+
+            const waitStart = performance.now();
+            dbg(`⏳ [AWAIT AUDIO] chunk=${chunkId} sent=${i}`);
+            const blob = await audioPromises[i];
+            dbg(`🟩 [AUDIO READY] chunk=${chunkId} sent=${i} waited_ms=${Math.round(performance.now() - waitStart)}`);
+
+            await playBlob(blob, { id: chunkId, i });
+
+            dbg(`🧽 [UNHIGHLIGHT] chunk=${chunkId} sent=${i}`);
+            spanGroup.forEach((el) => removeHighlight(el));
+          }
+
+          dbg(`\n==================== ✅ END CHUNK ${chunkId} ====================\n`);
+        }
+
+        else {
+          // fallback
           highlightSpan(currentSpan.element);
           await speakWithPiper(currentSpan.text);
           removeHighlight(currentSpan.element);
