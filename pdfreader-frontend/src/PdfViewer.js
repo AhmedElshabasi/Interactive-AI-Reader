@@ -17,12 +17,15 @@ export default function PdfViewer({ fileUrl }) {
   const [pageInput, setPageInput] = useState(1);
 
   // Buffer management for continuous reading
-  const textBuffer = useRef([]);
+  
   const bufferSize = 10;
   const isLoadingMore = useRef(false);
-  const readingQueue = useRef([]);
-  const currentSpanIndex = useRef(0);
+  
   const isReadingRef = useRef(isReading);
+
+const currentChunkRef = useRef(null);
+const nextChunkPromiseRef = useRef(null);
+const preparedChunksRef = useRef(new Map());
 
   // Piper/audio playback refs
   const audioRef = useRef(null);
@@ -258,6 +261,67 @@ function buildSentenceSpanGroups(rawText, spanRanges) {
     return chunks;
   }
 
+  function collectChunkFromStartSpan(startSpan, maxParagraphs = 5) {
+  const chunks = collectTextChunks(startSpan, maxParagraphs);
+  const allChunkSpans = chunks.flatMap(c => c.spans);
+  if (!allChunkSpans.length) return null;
+
+  const { rawText, ranges } = buildRawTextAndSpanRanges(allChunkSpans);
+  const rawSentenceSpanGroups = buildSentenceSpanGroups(rawText, ranges);
+
+  return {
+    startElement: allChunkSpans[0].element,
+    endElement: allChunkSpans[allChunkSpans.length - 1].element,
+    spans: allChunkSpans,
+    rawText,
+    rawSentenceSpanGroups,
+    chunkSize: allChunkSpans.length,
+  };
+}
+
+async function prepareChunkForPlayback(chunk) {
+  let cleanedText = chunk.rawText;
+  try {
+    cleanedText = await sendToChatGPT(chunk.rawText);
+  } catch {
+    cleanedText = chunk.rawText;
+  }
+
+  const cleanedSentences = splitIntoSentences(cleanedText);
+
+  return {
+    ...chunk,
+    cleanedText,
+    cleanedSentences,
+    chunkId: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+  };
+}
+
+async function buildChunkFromAnchor(anchorSpan) {
+  if (!anchorSpan) return null;
+
+  const rawChunk = collectChunkFromStartSpan(anchorSpan, 5);
+  if (!rawChunk) return null;
+
+  const preparedChunk = await prepareChunkForPlayback(rawChunk);
+
+  const controller = new AbortController();
+  preparedChunk.abortController = controller;
+  preparedChunk.audioPromise = prefetchChunkAudios(preparedChunk, controller.signal);
+
+  return preparedChunk;
+}
+
+async function buildAndPrefetchNextChunk(fromChunk) {
+  const lastSpan = fromChunk?.endElement;
+  if (!lastSpan) return null;
+
+  const nextSpan = getNextSpanGlobal(lastSpan);
+  if (!nextSpan) return null;
+
+  return await buildChunkFromAnchor(nextSpan);
+}
+
   async function sendToChatGPT(text) {
     console.log("Sending text to ChatGPT:", text);
     try {
@@ -448,260 +512,153 @@ async function playBlob(blob, meta = {}) {
 
 
 
-  function stopAudioNow() {
-    dbg("🛑 stopAudioNow(): aborting fetch + stopping audio");
+function stopAudioNow() {
+  dbg("🛑 stopAudioNow(): aborting fetch + stopping audio");
 
-    try {
-      if (ttsAbortRef.current) ttsAbortRef.current.abort();
-    } catch {}
-
-    try {
-      const audio = audioRef.current;
-      if (audio) {
-        audio.pause();
-        audio.currentTime = 0;
-        audio.src = "";
-      }
-    } catch {}
-
-    try {
-      if (audioObjectUrlRef.current) {
-        URL.revokeObjectURL(audioObjectUrlRef.current);
-        audioObjectUrlRef.current = null;
-      }
-    } catch {}
-  }
-
-
- async function processTextForTTS(spans) {
-  const startEl = spans?.[0]?.element;
-  if (!startEl) return spans || [];
-
-  // collectTextChunks returns [{spans:[{element,text}...], rawText: "..."}...]
-  const chunks = collectTextChunks(startEl, 5);
-
-  // Flatten all spans we are treating as one “chunk”
-  const allChunkSpans = chunks.flatMap(c => c.spans);
-  if (allChunkSpans.length === 0) return spans || [];
-
-  // Raw text (original) and sentence -> span mapping (for highlighting)
-  const { rawText, ranges } = buildRawTextAndSpanRanges(allChunkSpans);
-  const rawSentenceSpanGroups = buildSentenceSpanGroups(rawText, ranges);
-
-  // Cleaned text (ChatGPT) and sentence list (for Piper speech)
-  let cleanedText = rawText;
   try {
-    cleanedText = await sendToChatGPT(rawText);
-  } catch {
-    cleanedText = rawText;
-  }
-  const cleanedSentences = splitIntoSentences(cleanedText);
+    if (ttsAbortRef.current) ttsAbortRef.current.abort();
+  } catch {}
 
-  // Put everything onto the first span (the “chunk start”)
-  const processedSpans = [];
-
-  processedSpans.push({
-    ...allChunkSpans[0],
-    readyForTTS: true,
-    isChunkStart: true,
-    chunkSize: allChunkSpans.length,
-
-    // NEW payload:
-    rawText,
-    cleanedText,
-    cleanedSentences,
-    rawSentenceSpanGroups,
-  });
-
-  // Continuations (not individually spoken)
-  for (let i = 1; i < allChunkSpans.length; i++) {
-    processedSpans.push({
-      ...allChunkSpans[i],
-      readyForTTS: false,
-      isChunkStart: false,
-      chunkSize: allChunkSpans.length,
+  // Abort any pending prefetch controllers
+  if (window._prefetchControllers) {
+    window._prefetchControllers.forEach(c => {
+      try { c.abort(); } catch {}
     });
+    window._prefetchControllers = [];
   }
 
-  return processedSpans;
+  try {
+    const audio = audioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.src = "";
+    }
+  } catch {}
+
+  try {
+    if (audioObjectUrlRef.current) {
+      URL.revokeObjectURL(audioObjectUrlRef.current);
+      audioObjectUrlRef.current = null;
+    }
+  } catch {}
 }
 
+async function startReadingFromPosition(anchorSpan) {
+  if (!anchorSpan) return;
 
-  async function loadMoreTextIntoBuffer() {
-    if (isLoadingMore.current) return;
-    isLoadingMore.current = true;
+  setIsReading(true);
+  isReadingRef.current = true;
+  setCurrentReadingPosition(anchorSpan);
 
-    try {
-      const lastSpan = textBuffer.current[textBuffer.current.length - 1]?.element;
-      if (!lastSpan) return;
-
-      const nextSpan = getNextSpanGlobal(lastSpan);
-      if (!nextSpan) return;
-
-      const newSpans = getSpansFromPosition(nextSpan, bufferSize);
-      if (newSpans.length === 0) return;
-
-      const processedSpans = await processTextForTTS(newSpans);
-      textBuffer.current.push(...processedSpans);
-
-      if (textBuffer.current.length > bufferSize * 2) {
-        textBuffer.current = textBuffer.current.slice(-bufferSize);
-      }
-
-      console.log(
-        `Loaded ${newSpans.length} more spans into buffer. Buffer size: ${textBuffer.current.length}`
-      );
-    } catch (error) {
-      console.error("Error loading more text:", error);
-    } finally {
-      isLoadingMore.current = false;
-    }
-  }
-
-  async function startReadingFromPosition(anchorSpan) {
-    if (!anchorSpan) return;
-
-    setIsReading(true);
-    isReadingRef.current = true; // IMPORTANT: make the loop start immediately
-    setCurrentReadingPosition(anchorSpan);
-    currentSpanIndex.current = 0;
-
-    const initialSpans = getSpansFromPosition(anchorSpan, bufferSize);
-    const processedSpans = await processTextForTTS(initialSpans);
-
-    textBuffer.current = processedSpans;
-    readingQueue.current = [...processedSpans];
-
-    console.log(`Started reading with ${initialSpans.length} spans in buffer`);
-
-    startReadingLoop();
-  }
-
-  async function startReadingLoop() {
-    console.log("reading queue", readingQueue.current.length);
-    console.log("isReading", isReadingRef.current);
-
-    while (isReadingRef.current && readingQueue.current.length > 0) {
-      if (readingQueue.current.length < bufferSize / 2 && !isLoadingMore.current) {
-        loadMoreTextIntoBuffer().then(() => {
-          const newSpans = textBuffer.current.slice(-bufferSize / 2);
-          readingQueue.current.push(...newSpans);
-        });
-      }
-
-      const currentSpan = readingQueue.current.shift();
-      if (!currentSpan) break;
-
-      if (!currentSpan.readyForTTS) continue;
-
-      highlightSpan(currentSpan.element);
-
-      try {
-        if (currentSpan.isChunkStart) {
-          // Remove the rest of the chunk items from queue (we handle it internally)
-          for (let i = 0; i < currentSpan.chunkSize - 1; i++) {
-            readingQueue.current.shift();
-          }
-
-          const cleanedSentences = currentSpan.cleanedSentences || [];
-          const groups = currentSpan.rawSentenceSpanGroups || [];
-
-          // IMPORTANT: speak ALL cleaned sentences, even if we can't highlight all of them
-          const nSpeak = cleanedSentences.length;
-          const nHighlight = groups.length;
-
-          const chunkId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-
-          dbg(`\n==================== 🔊 START CHUNK ${chunkId} ====================`);
-          dbg(`Counts: cleanedSentences=${nSpeak}, rawSentenceGroups(highlight)=${nHighlight}, chunkSpans=${currentSpan.chunkSize}`);
-          if (nSpeak !== nHighlight) {
-            dbg(`⚠️ MISMATCH: will SPEAK ${nSpeak} sentences; will HIGHLIGHT up to ${nHighlight} sentences (missing highlights are expected).`);
-          }
-          dbg("===============================================================\n");
-
-          const controller = new AbortController();
-          ttsAbortRef.current = controller;
-
-          // Prefetch more aggressively to reduce “midway pause”
-          const prefetchWindow = 8;
-
-          // Store promises so they begin fetching as soon as assigned
-          const audioPromises = new Array(nSpeak);
-
-          const startPrefetch = (i) => {
-            if (i < 0 || i >= nSpeak) return;
-            if (audioPromises[i]) return;
-            audioPromises[i] = fetchPiperBlob(cleanedSentences[i], controller.signal, { id: chunkId, i });
-          };
-
-          // Prime pipeline
-          for (let i = 0; i < nSpeak; i++) startPrefetch(i);
-
-          const startupBufferCount = 4; // tweak: 3–6 is typical
-          dbg(`⏳ [STARTUP BUFFER] waiting for first ${startupBufferCount} sentences to be ready...`);
-
-          const startupWaits = [];
-          for (let i = 0; i < Math.min(startupBufferCount, nSpeak); i++) {
-            startupWaits.push(audioPromises[i]);
-          }
-          await Promise.all(startupWaits);
-
-          dbg(`✅ [STARTUP BUFFER] ready, starting playback`);
-
-
-          for (let i = 0; i < nSpeak; i++) {
-            if (!isReadingRef.current) {
-              dbg(`🛑 [STOPPED] chunk=${chunkId} at sentence=${i}`);
-              break;
-            }
-
-            // keep prefetching ahead
-            startPrefetch(i + prefetchWindow);
-
-            // Highlight if possible
-            const spanGroup = groups[i] || [];
-            dbg(`✨ [HIGHLIGHT] chunk=${chunkId} sent=${i} spans=${spanGroup.length}`);
-            spanGroup.forEach((el) => highlightSpan(el));
-
-            dbg(`⏳ [NEED SENTENCE] i=${i} pending=${audioPromises.filter(Boolean).length}/${nSpeak}`);
-
-            const waitStart = performance.now();
-            dbg(`⏳ [AWAIT AUDIO] chunk=${chunkId} sent=${i}`);
-            const blob = await audioPromises[i];
-            dbg(`🟩 [AUDIO READY] chunk=${chunkId} sent=${i} waited_ms=${Math.round(performance.now() - waitStart)}`);
-
-            await playBlob(blob, { id: chunkId, i });
-
-            dbg(`🧽 [UNHIGHLIGHT] chunk=${chunkId} sent=${i}`);
-            spanGroup.forEach((el) => removeHighlight(el));
-          }
-
-          dbg(`\n==================== ✅ END CHUNK ${chunkId} ====================\n`);
-        }
-
-        else {
-          // fallback
-          highlightSpan(currentSpan.element);
-          await speakWithPiper(currentSpan.text);
-          removeHighlight(currentSpan.element);
-        }
-
-      } catch (e) {
-        console.error("TTS playback error:", e);
-        // If TTS fails, stop so you don't get stuck in an error loop
-        stopReading();
-        break;
-      } finally {
-        removeHighlight(currentSpan.element);
-      }
-
-      currentSpanIndex.current++;
-    }
-
+  const initialChunk = await buildChunkFromAnchor(anchorSpan);
+  if (!initialChunk) {
     setIsReading(false);
     isReadingRef.current = false;
-    console.log("Reading finished");
+    return;
   }
+
+  currentChunkRef.current = initialChunk;
+  nextChunkPromiseRef.current = null;
+
+  startReadingLoop();
+}
+
+async function prefetchChunkAudios(chunkData, abortSignal) {
+  const sentences = chunkData.cleanedSentences || [];
+  if (!sentences.length) return [];
+
+  const blobs = new Array(sentences.length);
+
+  await Promise.allSettled(
+    sentences.map(async (sentence, idx) => {
+      try {
+        blobs[idx] = await fetchPiperBlob(sentence, abortSignal, {
+          id: chunkData.chunkId || "prefetch",
+          i: idx,
+          prefetch: true,
+        });
+      } catch (e) {
+        console.error(`Prefetch failed for sentence ${idx}:`, e);
+        blobs[idx] = null;
+      }
+    })
+  );
+
+  chunkData.audioBlobs = blobs;
+  return blobs;
+}
+
+async function startReadingLoop() {
+  while (isReadingRef.current && currentChunkRef.current) {
+    const currentChunk = currentChunkRef.current;
+
+    highlightSpan(currentChunk.startElement);
+
+    // Start preparing the next chunk immediately while current chunk is playing
+    if (!nextChunkPromiseRef.current) {
+      nextChunkPromiseRef.current = buildAndPrefetchNextChunk(currentChunk);
+    }
+
+  let blobs = currentChunk.audioBlobs;
+
+  // If blobs array does not exist yet, start/await generation
+  if (!blobs) {
+    blobs = currentChunk.audioPromise
+      ? await currentChunk.audioPromise
+      : await prefetchChunkAudios(currentChunk, currentChunk.abortController?.signal);
+    currentChunk.audioBlobs = blobs;
+  }
+
+  // If blobs array exists but is not populated yet, wait for the promise
+  else if (currentChunk.audioPromise) {
+    blobs = await currentChunk.audioPromise;
+    currentChunk.audioBlobs = blobs;
+  }
+
+    const groups = currentChunk.rawSentenceSpanGroups || [];
+    const nSpeak = currentChunk.cleanedSentences?.length || 0;
+
+    dbg(`\n===== START CHUNK ${currentChunk.chunkId} (${nSpeak} sentences) =====`);
+
+    for (let i = 0; i < nSpeak; i++) {
+      if (!isReadingRef.current) {
+        dbg(`🛑 Stopped at sentence ${i} of chunk ${currentChunk.chunkId}`);
+        break;
+      }
+
+      const spanGroup = groups[i] || [];
+      spanGroup.forEach(el => highlightSpan(el));
+
+      const sentenceBlob = currentChunk.audioBlobs?.[i];
+      if (sentenceBlob) {
+        await playBlob(sentenceBlob, { id: currentChunk.chunkId, i });
+      } else {
+        console.warn(`Missing blob for sentence ${i}, skipping`);
+      }
+
+      spanGroup.forEach(el => removeHighlight(el));
+    }
+
+    dbg(`===== END CHUNK ${currentChunk.chunkId} =====`);
+
+    removeHighlight(currentChunk.startElement);
+
+    const nextChunk = await nextChunkPromiseRef.current;
+    nextChunkPromiseRef.current = null;
+    currentChunkRef.current = nextChunk;
+  }
+
+  setIsReading(false);
+  isReadingRef.current = false;
+
+  if (window._prefetchControllers) {
+    window._prefetchControllers.forEach(c => c.abort());
+    window._prefetchControllers = [];
+  }
+
+  console.log("Reading finished");
+}
 
  function highlightSpan(spanElement) {
   if (!spanElement) return;
@@ -714,18 +671,23 @@ function removeHighlight(spanElement) {
 }
 
 
-  function stopReading() {
-    // Make loop stop immediately
-    isReadingRef.current = false;
-    setIsReading(false);
+function stopReading() {
+  isReadingRef.current = false;
+  setIsReading(false);
 
-    readingQueue.current = [];
-    stopAudioNow();
+  try {
+    currentChunkRef.current?.abortController?.abort();
+  } catch {}
 
-    document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
-      removeHighlight(span);
-    });
-  }
+  currentChunkRef.current = null;
+  nextChunkPromiseRef.current = null;
+
+  stopAudioNow();
+
+  document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
+    removeHighlight(span);
+  });
+}
 
   useEffect(() => {
     const handleMouseUp = () => {
@@ -864,7 +826,7 @@ function removeHighlight(spanElement) {
 
         {isReading && (
           <span style={{ marginLeft: "10px", color: "#666" }}>
-            Reading... Buffer: {textBuffer.current.length} spans
+            Reading...
           </span>
         )}
       </div>
