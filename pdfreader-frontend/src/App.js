@@ -10,7 +10,8 @@ function App() {
       <PdfViewer
         fileUrl={
           process.env.REACT_APP_DEFAULT_PDF_URL ||
-          "https://mozilla.github.io/pdf.js/web/compressed.tracemonkey-pldi-09.pdf"
+
+          "/Ammous,_Saifedean_The_Bitcoin_standard_the_decentralized_alternative.pdf"
         }
       />
     </div>
