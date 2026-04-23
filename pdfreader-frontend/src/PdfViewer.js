@@ -10,6 +10,7 @@ const API_BASE = (process.env.REACT_APP_API_BASE_URL || "http://localhost:8000/a
   /\/$/,
   ""
 );
+const hasDesktopTTS = typeof window !== "undefined" && !!window.desktopTTS?.speak;
 
 export default function PdfViewer({ fileUrl }) {
   const [numPages, setNumPages] = useState(null);
@@ -230,19 +231,25 @@ export default function PdfViewer({ fileUrl }) {
     const controller = new AbortController();
     ttsAbortRef.current = controller;
 
-    const res = await fetch(`${API_BASE}/tts/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: cleaned }),
-      signal: controller.signal,
-    });
+    let blob;
+    if (hasDesktopTTS) {
+      const wavBytes = await window.desktopTTS.speak(cleaned);
+      blob = new Blob([wavBytes], { type: "audio/wav" });
+    } else {
+      const res = await fetch(`${API_BASE}/tts/`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: cleaned }),
+        signal: controller.signal,
+      });
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`TTS failed (${res.status}): ${errText || "Unknown error"}`);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`TTS failed (${res.status}): ${errText || "Unknown error"}`);
+      }
+
+      blob = await res.blob();
     }
-
-    const blob = await res.blob();
 
     if (!audioRef.current) return;
 
