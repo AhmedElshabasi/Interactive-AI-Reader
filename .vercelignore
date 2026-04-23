@@ -1,0 +1,7 @@
+backend
+*.py
+__pycache__
+*.pyc
+.env
+.env.*
+output_text.txt
