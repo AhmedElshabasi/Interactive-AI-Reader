@@ -3,15 +3,18 @@ import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 
-// Set workerSrc for pdfjs
-pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.mjs`;
+// Set workerSrc for pdfjs (explicit https for production / strict CSP)
+pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.mjs`;
 
-const API_BASE = "http://localhost:8000/api";
+const API_BASE = (process.env.REACT_APP_API_BASE_URL || "http://localhost:8000/api").replace(
+  /\/$/,
+  ""
+);
 
 export default function PdfViewer({ fileUrl }) {
   const [numPages, setNumPages] = useState(null);
   const [isReading, setIsReading] = useState(false);
-  const [currentReadingPosition, setCurrentReadingPosition] = useState(null);
+  const [, setCurrentReadingPosition] = useState(null);
   const [theme, setTheme] = useState("dark");
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState(1);
@@ -515,6 +518,8 @@ function removeHighlight(spanElement) {
     return () => {
       document.removeEventListener("mouseup", handleMouseUp);
     };
+    // startReadingFromPosition is recreated each render; listing it would rebind the listener every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: only rebind when isReading toggles
   }, [isReading]);
 
   useEffect(() => {
