@@ -6,6 +6,7 @@ __pycache__/
 **/.env
 howToRun.txt
 run.bat
+run_electron.bat
 ARCHITECTURE.md
 STREAMING_TTS_GUIDE.md
 PIPER_TTS_SETUP.md

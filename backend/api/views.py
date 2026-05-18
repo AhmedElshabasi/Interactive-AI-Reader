@@ -20,13 +20,69 @@ from rest_framework import status
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def _strip_surrogates(text):
+    if not text:
+        return ""
+    out = []
+    i = 0
+    s = str(text)
+    while i < len(s):
+        code = ord(s[i])
+        if 0xD800 <= code <= 0xDBFF:
+            if i + 1 < len(s) and 0xDC00 <= ord(s[i + 1]) <= 0xDFFF:
+                out.append(s[i])
+                out.append(s[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+        if 0xDC00 <= code <= 0xDFFF:
+            i += 1
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _sanitize_text_for_tts(text):
+    """Remove lone UTF-16 surrogates and control chars that break espeak/Piper."""
+    if not text:
+        return ""
+    import re
+    out = _strip_surrogates(str(text))
+    out = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", out)
+    out = out.replace("\u00a0", " ")
+    out = out.replace("\u2018", "'").replace("\u2019", "'").replace("\u2032", "'")
+    out = out.replace("\u201c", '"').replace("\u201d", '"').replace("\u2033", '"')
+    out = out.replace("\u2013", "-").replace("\u2014", "-")
+    out = out.replace("\u2026", "...")
+    out = re.sub(r"[\u200b-\u200d\ufeff]", "", out)
+    try:
+        import unicodedata
+        out = unicodedata.normalize("NFKC", out)
+        out = _strip_surrogates(out)
+    except Exception:
+        pass
+    out = out.encode("utf-8", errors="replace").decode("utf-8")
+    return out.strip()
+
+
 @csrf_exempt
 def chatgpt(request):
     if request.method == 'POST':
         try:
             data = json.loads(request.body)
-            user_input = data.get('prompt', '')
+            user_input = _sanitize_text_for_tts(data.get('prompt', ''))
             max_tokens = data.get('max_tokens', 1000)
+            chunk_index = data.get('chunk_index', '?')
+            session_id = data.get('session_id', 'default')
+            char_count = data.get('char_count', len(user_input))
+
+            progress_prefix = f"[Reading {session_id}] Chunk {chunk_index}"
+            start_msg = f"{progress_prefix}: ChatGPT cleanup started ({char_count} chars in)"
+            logger.info(start_msg)
+            print(start_msg, flush=True)
 
             messages = [
                 {
@@ -53,19 +109,34 @@ def chatgpt(request):
                 }
             )
 
-            return JsonResponse(response.json())
+            result = response.json()
+            if response.ok and result.get('choices'):
+                out_len = len(result['choices'][0].get('message', {}).get('content', ''))
+                done_msg = f"{progress_prefix}: ChatGPT cleanup done ({out_len} chars out)"
+            else:
+                done_msg = f"{progress_prefix}: ChatGPT request finished (HTTP {response.status_code})"
+            logger.info(done_msg)
+            print(done_msg, flush=True)
+
+            return JsonResponse(result, status=response.status_code)
 
         except Exception as e:
+            err_msg = f"[Reading] ChatGPT error: {e}"
+            logger.error(err_msg, exc_info=True)
+            print(err_msg, flush=True)
             return JsonResponse({'error': str(e)}, status=500)
 
     return JsonResponse({'error': 'Only POST requests allowed'}, status=405)
 
 
-# Helper function to generate audio from text using Piper TTS
 def generate_audio_from_text(text, model_path=None, snippet_index=None):
     """Generate audio file from text using Piper TTS. Returns path to audio file."""
     import logging
     logger = logging.getLogger(__name__)
+
+    text = _sanitize_text_for_tts(text)
+    if not text:
+        raise ValueError("No speakable text after sanitization")
     
     snippet_info = f"[Snippet {snippet_index}]" if snippet_index is not None else "[Single]"
     text_preview = text[:50] + "..." if len(text) > 50 else text
