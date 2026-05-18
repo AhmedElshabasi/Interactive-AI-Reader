@@ -28,6 +28,12 @@ export default function PdfViewer({ fileUrl }) {
   const prefetchPromise = useRef(null);
   const chunkIndexRef = useRef(0);
   const readingSessionIdRef = useRef(null);
+  const spokenFingerprintsRef = useRef([]);
+
+  const MIN_CHARS_PER_CHUNK = 400;
+  const MIN_CHARS_FOR_GPT = 200;
+  const MAX_CHARS_PER_CHUNK = 2800;
+  const MAX_GPT_EXPANSION_RATIO = 2.2;
 
   // Piper/audio playback refs
   const audioRef = useRef(null);
@@ -126,30 +132,150 @@ export default function PdfViewer({ fileUrl }) {
     return false;
   }
 
-  function collectTextChunks(startSpan, maxParagraphs = 5) {
+  function isSpanConsumed(span) {
+    return !!span?.dataset?.ttsRead;
+  }
+
+  function markSpansConsumed(spanElements) {
+    for (const el of spanElements) {
+      if (el) el.dataset.ttsRead = "1";
+    }
+  }
+
+  function clearConsumedSpanMarks() {
+    document.querySelectorAll(".react-pdf__Page__textContent span[data-tts-read]").forEach((span) => {
+      delete span.dataset.ttsRead;
+    });
+  }
+
+  function normalizeForDedup(text) {
+    return sanitizeForTTS(text).toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  function getTextOverlapScore(a, b) {
+    if (!a || !b) return 0;
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+    if (shorter.length < 40) return 0;
+    if (longer.includes(shorter)) {
+      return shorter.length / longer.length;
+    }
+    const windowSize = Math.min(200, shorter.length);
+    let best = 0;
+    for (let i = 0; i + 40 <= shorter.length; i += Math.max(40, Math.floor(windowSize / 2))) {
+      const probe = shorter.slice(i, i + windowSize);
+      if (probe.length >= 40 && longer.includes(probe)) {
+        best = Math.max(best, probe.length / shorter.length);
+      }
+    }
+    return best;
+  }
+
+  function isMostlyDuplicate(norm) {
+    if (!norm || norm.length < 80) return false;
+    for (const prior of spokenFingerprintsRef.current) {
+      if (getTextOverlapScore(norm, prior) >= 0.65) return true;
+    }
+    return false;
+  }
+
+  function recordSpokenFingerprint(norm) {
+    if (!norm || norm.length < 40) return;
+    spokenFingerprintsRef.current.push(norm);
+    if (spokenFingerprintsRef.current.length > 6) {
+      spokenFingerprintsRef.current.shift();
+    }
+  }
+
+  /** PDF.js often exposes the same passage as different span trees; mark all overlapping spans. */
+  function markOverlappingSpansInDocument(chunkNorm) {
+    if (!chunkNorm || chunkNorm.length < 40) return;
+
+    const probes = [];
+    const len = chunkNorm.length;
+    for (const start of [0, Math.floor(len / 3), Math.floor((2 * len) / 3)]) {
+      const probe = chunkNorm.slice(start, start + 120);
+      if (probe.length >= 30) probes.push(probe);
+    }
+
+    document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
+      if (span.dataset.ttsRead) return;
+      const t = normalizeForDedup(span.textContent);
+      if (t.length < 10) return;
+      if (t.length >= 12 && chunkNorm.includes(t)) {
+        span.dataset.ttsRead = "1";
+        return;
+      }
+      for (const probe of probes) {
+        if ((t.length >= 20 && t.includes(probe)) || (probe.length >= 30 && chunkNorm.includes(t))) {
+          span.dataset.ttsRead = "1";
+          return;
+        }
+      }
+    });
+  }
+
+  function skipConsumedSpans(span) {
+    let current = span;
+    while (current && isSpanConsumed(current)) {
+      current = getNextSpanGlobal(current);
+    }
+    return current;
+  }
+
+  function looksLikeHeadingOnly(text) {
+    const t = (text || "").trim();
+    if (t.length > 120) return false;
+    return /^[A-Z0-9][A-Za-z0-9\s:'",-]{0,120}$/.test(t) && !/[.!?]/.test(t);
+  }
+
+  function collectTextChunks(startSpan, options = {}) {
+    const minChars = options.minChars ?? MIN_CHARS_PER_CHUNK;
+    const maxChars = options.maxChars ?? MAX_CHARS_PER_CHUNK;
+    const maxParagraphs = options.maxParagraphs ?? 8;
+
+    let currentSpan = skipConsumedSpans(startSpan);
+    if (!currentSpan) {
+      return { chunks: [], nextSpan: null, combinedLength: 0 };
+    }
+
     const chunks = [];
-    let currentSpan = startSpan;
     let paragraphCount = 0;
     let currentChunk = [];
+    let totalChars = 0;
 
-    while (currentSpan && paragraphCount < maxParagraphs) {
+    const flushCurrentChunk = () => {
+      if (currentChunk.length === 0) return;
+      const rawText = currentChunk.map((s) => s.text).join(" ");
+      chunks.push({
+        spans: [...currentChunk],
+        rawText,
+        paragraphNumber: paragraphCount + 1,
+      });
+      totalChars += rawText.length + 2;
+      currentChunk = [];
+      paragraphCount++;
+    };
+
+    while (
+      currentSpan &&
+      totalChars < maxChars &&
+      (totalChars < minChars || paragraphCount < maxParagraphs)
+    ) {
+      if (isSpanConsumed(currentSpan)) {
+        currentSpan = getNextSpanGlobal(currentSpan);
+        continue;
+      }
+
       const text = currentSpan.textContent.trim();
-
       if (text.length > 0) {
-        currentChunk.push({
-          element: currentSpan,
-          text,
-        });
+        currentChunk.push({ element: currentSpan, text });
 
         if (isEndOfParagraph(currentSpan)) {
-          if (currentChunk.length > 0) {
-            chunks.push({
-              spans: [...currentChunk],
-              rawText: currentChunk.map((s) => s.text).join(" "),
-              paragraphNumber: paragraphCount + 1,
-            });
-            currentChunk = [];
-            paragraphCount++;
+          flushCurrentChunk();
+          if (totalChars >= minChars) {
+            currentSpan = getNextSpanGlobal(currentSpan);
+            break;
           }
         }
       }
@@ -157,15 +283,17 @@ export default function PdfViewer({ fileUrl }) {
       currentSpan = getNextSpanGlobal(currentSpan);
     }
 
-    if (currentChunk.length > 0) {
-      chunks.push({
-        spans: currentChunk,
-        rawText: currentChunk.map((s) => s.text).join(" "),
-        paragraphNumber: paragraphCount + 1,
-      });
+    if (currentChunk.length > 0 && totalChars < maxChars) {
+      flushCurrentChunk();
     }
 
-    return chunks;
+    const chunkItems = chunks.flatMap((c) => c.spans);
+    const lastElement = chunkItems.length > 0 ? chunkItems[chunkItems.length - 1].element : null;
+    const nextSpan = skipConsumedSpans(
+      lastElement ? getNextSpanGlobal(lastElement) : null
+    );
+
+    return { chunks, nextSpan, combinedLength: totalChars };
   }
 
   async function sendToChatGPT(text, { chunkIndex = 0, sessionId = "default" } = {}) {
@@ -176,7 +304,7 @@ export default function PdfViewer({ fileUrl }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          prompt: `Clean and format this text for text-to-speech reading. Make it flow naturally and fix any formatting issues. Do not, I repeat do not change the content of the text. Print it back as is but with no formatting issues and with no things like page numbers and stuff that cuts the flow of the ideas.: \n\n${text}`,
+          prompt: `Clean and format the following excerpt for text-to-speech. Fix spacing and line breaks only. Rules: do NOT add new sentences; do NOT invent or continue the passage; do NOT summarize; if the input is only a title or heading, return only that title. Return the same content, cleaned for reading aloud:\n\n${text}`,
           max_tokens: 1000,
           chunk_index: chunkIndex,
           session_id: sessionId,
@@ -325,22 +453,78 @@ export default function PdfViewer({ fileUrl }) {
   }
 
   async function buildChunkFromSpan(startSpan, chunkIndex, sessionId) {
-    const chunks = collectTextChunks(startSpan, 2);
-    if (chunks.length === 0) return null;
+    let cursor = startSpan;
+    let chunks;
+    let nextSpan;
+    let combinedLength;
+    let chunkItems;
+    let accepted = false;
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+      ({ chunks, nextSpan, combinedLength } = collectTextChunks(cursor));
+      if (chunks.length === 0) return null;
+
+      chunkItems = chunks.flatMap((c) =>
+        c.spans.map((s) => ({ element: s.element, text: s.text }))
+      );
+      if (chunkItems.length === 0) return null;
+
+      const combinedText = sanitizeForTTS(chunks.map((c) => c.rawText).join("\n\n"));
+      const norm = normalizeForDedup(combinedText);
+
+      if (norm.length >= 80 && isMostlyDuplicate(norm)) {
+        console.log(
+          `[Reading ${sessionId}] Chunk ${chunkIndex}: skipping duplicate text (${norm.length} chars), advancing cursor`
+        );
+        markSpansConsumed(chunkItems.map((item) => item.element));
+        markOverlappingSpansInDocument(norm);
+        cursor = nextSpan;
+        if (!cursor) return null;
+        continue;
+      }
+
+      markSpansConsumed(chunkItems.map((item) => item.element));
+      markOverlappingSpansInDocument(norm);
+      recordSpokenFingerprint(norm);
+      accepted = true;
+      break;
+    }
+
+    if (!accepted || !chunks?.length || !chunkItems?.length) {
+      console.warn(
+        `[Reading ${sessionId}] Chunk ${chunkIndex}: no new text after duplicate skips`
+      );
+      return null;
+    }
 
     const combinedText = sanitizeForTTS(chunks.map((c) => c.rawText).join("\n\n"));
-    const chunkItems = chunks.flatMap((c) =>
-      c.spans.map((s) => ({ element: s.element, text: s.text }))
-    );
-    if (chunkItems.length === 0) return null;
-
     let cleanedText = combinedText;
-    const gptResult = await sendToChatGPT(combinedText, { chunkIndex, sessionId });
-    if (gptResult) {
-      cleanedText = sanitizeForTTS(gptResult);
+
+    const canUseGpt =
+      combinedText.length >= MIN_CHARS_FOR_GPT && !looksLikeHeadingOnly(combinedText);
+
+    if (canUseGpt) {
+      const gptResult = await sendToChatGPT(combinedText, { chunkIndex, sessionId });
+      if (gptResult) {
+        const maxAllowed = Math.max(
+          combinedText.length * MAX_GPT_EXPANSION_RATIO,
+          combinedText.length + 150
+        );
+        if (gptResult.length <= maxAllowed) {
+          cleanedText = sanitizeForTTS(gptResult);
+        } else {
+          console.warn(
+            `[Reading ${sessionId}] Chunk ${chunkIndex}: ChatGPT expanded ${combinedText.length} -> ${gptResult.length} chars; using raw PDF text`
+          );
+        }
+      } else {
+        console.warn(
+          `[Reading ${sessionId}] Chunk ${chunkIndex}: using raw PDF text (ChatGPT unavailable)`
+        );
+      }
     } else {
-      console.warn(
-        `[Reading ${sessionId}] Chunk ${chunkIndex}: using raw PDF text (ChatGPT unavailable)`
+      console.log(
+        `[Reading ${sessionId}] Chunk ${chunkIndex}: skipping ChatGPT (${combinedLength} chars from PDF, heading-only or too short)`
       );
     }
 
@@ -355,9 +539,6 @@ export default function PdfViewer({ fileUrl }) {
     if (!audioBlobs.length) {
       throw new Error("TTS produced no audio");
     }
-
-    const lastElement = chunkItems[chunkItems.length - 1].element;
-    const nextSpan = getNextSpanGlobal(lastElement);
 
     return { audioBlobs, chunkItems, cleanedText, chunkIndex, nextSpan };
   }
@@ -391,7 +572,17 @@ export default function PdfViewer({ fileUrl }) {
         return chunk;
       } catch (error) {
         console.error(`[Reading ${sessionId}] Chunk ${chunkIndex} prepare failed:`, error);
-        readCursorRef.current = getNextSpanGlobal(startSpan);
+        const skip = collectTextChunks(startSpan, {
+          minChars: 80,
+          maxChars: 400,
+          maxParagraphs: 2,
+        });
+        if (skip.chunks?.length) {
+          markSpansConsumed(
+            skip.chunks.flatMap((c) => c.spans.map((s) => s.element))
+          );
+        }
+        readCursorRef.current = skip.nextSpan || getNextSpanGlobal(startSpan);
         chunkIndexRef.current += 1;
         return null;
       } finally {
@@ -410,6 +601,8 @@ export default function PdfViewer({ fileUrl }) {
     readCursorRef.current = anchorSpan;
     preparedQueue.current = [];
     prefetchPromise.current = null;
+    spokenFingerprintsRef.current = [];
+    clearConsumedSpanMarks();
 
     setIsReading(true);
     isReadingRef.current = true;
@@ -488,7 +681,9 @@ function removeHighlight(spanElement) {
     preparedQueue.current = [];
     prefetchPromise.current = null;
     readCursorRef.current = null;
+    spokenFingerprintsRef.current = [];
     stopAudioNow();
+    clearConsumedSpanMarks();
 
     document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
       removeHighlight(span);
