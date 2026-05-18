@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
+import { sanitizeForTTS, splitTextForTTS } from "./ttsSanitize";
 
 // Set workerSrc for pdfjs (explicit https for production / strict CSP)
 pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.mjs`;
@@ -10,6 +11,7 @@ const API_BASE = (process.env.REACT_APP_API_BASE_URL || "http://localhost:8000/a
   /\/$/,
   ""
 );
+const hasDesktopTTS = typeof window !== "undefined" && !!window.desktopTTS?.speak;
 
 export default function PdfViewer({ fileUrl }) {
   const [numPages, setNumPages] = useState(null);
@@ -18,14 +20,20 @@ export default function PdfViewer({ fileUrl }) {
   const [theme, setTheme] = useState("dark");
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState(1);
+  const [readingStatus, setReadingStatus] = useState("");
 
-  // Buffer management for continuous reading
-  const textBuffer = useRef([]);
-  const bufferSize = 10;
-  const isLoadingMore = useRef(false);
-  const readingQueue = useRef([]);
-  const currentSpanIndex = useRef(0);
   const isReadingRef = useRef(isReading);
+  const readCursorRef = useRef(null);
+  const preparedQueue = useRef([]);
+  const prefetchPromise = useRef(null);
+  const chunkIndexRef = useRef(0);
+  const readingSessionIdRef = useRef(null);
+  const spokenFingerprintsRef = useRef([]);
+
+  const MIN_CHARS_PER_CHUNK = 400;
+  const MIN_CHARS_FOR_GPT = 200;
+  const MAX_CHARS_PER_CHUNK = 2800;
+  const MAX_GPT_EXPANSION_RATIO = 2.2;
 
   // Piper/audio playback refs
   const audioRef = useRef(null);
@@ -89,25 +97,6 @@ export default function PdfViewer({ fileUrl }) {
     return null;
   }
 
-  function getSpansFromPosition(startSpan, count = bufferSize) {
-    const spans = [];
-    let currentSpan = startSpan;
-
-    for (let i = 0; i < count && currentSpan; i++) {
-      const text = currentSpan.textContent.trim();
-      if (text.length > 0) {
-        spans.push({
-          element: currentSpan,
-          text,
-          index: i,
-        });
-      }
-      currentSpan = getNextSpanGlobal(currentSpan);
-    }
-
-    return spans;
-  }
-
   function isEndOfParagraph(spanElement) {
     if (!spanElement) return false;
 
@@ -143,30 +132,150 @@ export default function PdfViewer({ fileUrl }) {
     return false;
   }
 
-  function collectTextChunks(startSpan, maxParagraphs = 5) {
+  function isSpanConsumed(span) {
+    return !!span?.dataset?.ttsRead;
+  }
+
+  function markSpansConsumed(spanElements) {
+    for (const el of spanElements) {
+      if (el) el.dataset.ttsRead = "1";
+    }
+  }
+
+  function clearConsumedSpanMarks() {
+    document.querySelectorAll(".react-pdf__Page__textContent span[data-tts-read]").forEach((span) => {
+      delete span.dataset.ttsRead;
+    });
+  }
+
+  function normalizeForDedup(text) {
+    return sanitizeForTTS(text).toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  function getTextOverlapScore(a, b) {
+    if (!a || !b) return 0;
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+    if (shorter.length < 40) return 0;
+    if (longer.includes(shorter)) {
+      return shorter.length / longer.length;
+    }
+    const windowSize = Math.min(200, shorter.length);
+    let best = 0;
+    for (let i = 0; i + 40 <= shorter.length; i += Math.max(40, Math.floor(windowSize / 2))) {
+      const probe = shorter.slice(i, i + windowSize);
+      if (probe.length >= 40 && longer.includes(probe)) {
+        best = Math.max(best, probe.length / shorter.length);
+      }
+    }
+    return best;
+  }
+
+  function isMostlyDuplicate(norm) {
+    if (!norm || norm.length < 80) return false;
+    for (const prior of spokenFingerprintsRef.current) {
+      if (getTextOverlapScore(norm, prior) >= 0.65) return true;
+    }
+    return false;
+  }
+
+  function recordSpokenFingerprint(norm) {
+    if (!norm || norm.length < 40) return;
+    spokenFingerprintsRef.current.push(norm);
+    if (spokenFingerprintsRef.current.length > 6) {
+      spokenFingerprintsRef.current.shift();
+    }
+  }
+
+  /** PDF.js often exposes the same passage as different span trees; mark all overlapping spans. */
+  function markOverlappingSpansInDocument(chunkNorm) {
+    if (!chunkNorm || chunkNorm.length < 40) return;
+
+    const probes = [];
+    const len = chunkNorm.length;
+    for (const start of [0, Math.floor(len / 3), Math.floor((2 * len) / 3)]) {
+      const probe = chunkNorm.slice(start, start + 120);
+      if (probe.length >= 30) probes.push(probe);
+    }
+
+    document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
+      if (span.dataset.ttsRead) return;
+      const t = normalizeForDedup(span.textContent);
+      if (t.length < 10) return;
+      if (t.length >= 12 && chunkNorm.includes(t)) {
+        span.dataset.ttsRead = "1";
+        return;
+      }
+      for (const probe of probes) {
+        if ((t.length >= 20 && t.includes(probe)) || (probe.length >= 30 && chunkNorm.includes(t))) {
+          span.dataset.ttsRead = "1";
+          return;
+        }
+      }
+    });
+  }
+
+  function skipConsumedSpans(span) {
+    let current = span;
+    while (current && isSpanConsumed(current)) {
+      current = getNextSpanGlobal(current);
+    }
+    return current;
+  }
+
+  function looksLikeHeadingOnly(text) {
+    const t = (text || "").trim();
+    if (t.length > 120) return false;
+    return /^[A-Z0-9][A-Za-z0-9\s:'",-]{0,120}$/.test(t) && !/[.!?]/.test(t);
+  }
+
+  function collectTextChunks(startSpan, options = {}) {
+    const minChars = options.minChars ?? MIN_CHARS_PER_CHUNK;
+    const maxChars = options.maxChars ?? MAX_CHARS_PER_CHUNK;
+    const maxParagraphs = options.maxParagraphs ?? 8;
+
+    let currentSpan = skipConsumedSpans(startSpan);
+    if (!currentSpan) {
+      return { chunks: [], nextSpan: null, combinedLength: 0 };
+    }
+
     const chunks = [];
-    let currentSpan = startSpan;
     let paragraphCount = 0;
     let currentChunk = [];
+    let totalChars = 0;
 
-    while (currentSpan && paragraphCount < maxParagraphs) {
+    const flushCurrentChunk = () => {
+      if (currentChunk.length === 0) return;
+      const rawText = currentChunk.map((s) => s.text).join(" ");
+      chunks.push({
+        spans: [...currentChunk],
+        rawText,
+        paragraphNumber: paragraphCount + 1,
+      });
+      totalChars += rawText.length + 2;
+      currentChunk = [];
+      paragraphCount++;
+    };
+
+    while (
+      currentSpan &&
+      totalChars < maxChars &&
+      (totalChars < minChars || paragraphCount < maxParagraphs)
+    ) {
+      if (isSpanConsumed(currentSpan)) {
+        currentSpan = getNextSpanGlobal(currentSpan);
+        continue;
+      }
+
       const text = currentSpan.textContent.trim();
-
       if (text.length > 0) {
-        currentChunk.push({
-          element: currentSpan,
-          text,
-        });
+        currentChunk.push({ element: currentSpan, text });
 
         if (isEndOfParagraph(currentSpan)) {
-          if (currentChunk.length > 0) {
-            chunks.push({
-              spans: [...currentChunk],
-              rawText: currentChunk.map((s) => s.text).join(" "),
-              paragraphNumber: paragraphCount + 1,
-            });
-            currentChunk = [];
-            paragraphCount++;
+          flushCurrentChunk();
+          if (totalChars >= minChars) {
+            currentSpan = getNextSpanGlobal(currentSpan);
+            break;
           }
         }
       }
@@ -174,79 +283,115 @@ export default function PdfViewer({ fileUrl }) {
       currentSpan = getNextSpanGlobal(currentSpan);
     }
 
-    if (currentChunk.length > 0) {
-      chunks.push({
-        spans: currentChunk,
-        rawText: currentChunk.map((s) => s.text).join(" "),
-        paragraphNumber: paragraphCount + 1,
-      });
+    if (currentChunk.length > 0 && totalChars < maxChars) {
+      flushCurrentChunk();
     }
 
-    return chunks;
+    const chunkItems = chunks.flatMap((c) => c.spans);
+    const lastElement = chunkItems.length > 0 ? chunkItems[chunkItems.length - 1].element : null;
+    const nextSpan = skipConsumedSpans(
+      lastElement ? getNextSpanGlobal(lastElement) : null
+    );
+
+    return { chunks, nextSpan, combinedLength: totalChars };
   }
 
-  async function sendToChatGPT(text) {
-    console.log("Sending text to ChatGPT:", text);
+  async function sendToChatGPT(text, { chunkIndex = 0, sessionId = "default" } = {}) {
+    const charCount = (text || "").length;
+    console.log(`[Reading ${sessionId}] Chunk ${chunkIndex}: sending ${charCount} chars to ChatGPT`);
     try {
       const response = await fetch(`${API_BASE}/chatgpt/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          prompt: `Clean and format this text for text-to-speech reading. Make it flow naturally and fix any formatting issues. Do not, I repeat do not change the content of the text. Print it back as is but with no formatting issues and with no things like page numbers and stuff that cuts the flow of the ideas.: \n\n${text}`,
+          prompt: `Clean and format the following excerpt for text-to-speech. Fix spacing and line breaks only. Rules: do NOT add new sentences; do NOT invent or continue the passage; do NOT summarize; if the input is only a title or heading, return only that title. Return the same content, cleaned for reading aloud:\n\n${text}`,
           max_tokens: 1000,
+          chunk_index: chunkIndex,
+          session_id: sessionId,
+          char_count: charCount,
         }),
       });
 
       const data = await response.json();
 
-    if (data.choices && data.choices.length > 0) {
-      const cleaned = data.choices[0].message.content.trim();
-
-      console.log("===== ChatGPT CLEANED TEXT (what Piper will speak) =====");
-      console.log(cleaned);
-      console.log("========================================================");
-
-      return cleaned;
-    }
+      if (data.choices && data.choices.length > 0) {
+        const cleaned = data.choices[0].message.content.trim();
+        console.log(
+          `[Reading ${sessionId}] Chunk ${chunkIndex}: ChatGPT returned ${cleaned.length} chars`
+        );
+        console.log("===== ChatGPT CLEANED TEXT (what Piper will speak) =====");
+        console.log(cleaned);
+        console.log("========================================================");
+        return cleaned;
+      }
 
       console.error("Unexpected response from ChatGPT API:", data);
-      return "[Error] Could not process text";
+      return null;
     } catch (error) {
       console.error("Error sending request to Django API:", error);
-      return "[Error] Failed to contact ChatGPT backend";
+      return null;
     }
   }
 
-  // NEW: Piper TTS playback via backend /api/tts/
-  async function speakWithPiper(text) {
-    const cleaned = (text || "").trim();
-    if (!cleaned) return;
+  async function synthesizeSpeech(text) {
+    const segments = splitTextForTTS(text, 500);
+    if (segments.length === 0) {
+      throw new Error("No text provided for TTS.");
+    }
 
-    // Abort any previous in-flight TTS request
+    const blobs = [];
+
+    if (hasDesktopTTS) {
+      for (let i = 0; i < segments.length; i++) {
+        try {
+          const result = await window.desktopTTS.speak(segments[i]);
+          const buffers = Array.isArray(result) ? result : [result];
+          for (const wavBytes of buffers) {
+            blobs.push(new Blob([wavBytes], { type: "audio/wav" }));
+          }
+        } catch (err) {
+          console.warn(
+            `[Reading] TTS segment ${i + 1}/${segments.length} skipped:`,
+            err.message || err
+          );
+        }
+      }
+    } else {
+      for (let i = 0; i < segments.length; i++) {
+        try {
+          const res = await fetch(`${API_BASE}/tts/`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: segments[i] }),
+          });
+          if (!res.ok) {
+            throw new Error(`TTS failed (${res.status})`);
+          }
+          blobs.push(await res.blob());
+        } catch (err) {
+          console.warn(
+            `[Reading] TTS segment ${i + 1}/${segments.length} skipped:`,
+            err.message || err
+          );
+        }
+      }
+    }
+
+    if (blobs.length === 0) {
+      throw new Error("TTS failed for all segments.");
+    }
+
+    return blobs;
+  }
+
+  async function playAudioBlob(blob) {
+    if (!blob || !audioRef.current) return;
+
     try {
       if (ttsAbortRef.current) ttsAbortRef.current.abort();
     } catch {}
+    ttsAbortRef.current = null;
 
-    const controller = new AbortController();
-    ttsAbortRef.current = controller;
-
-    const res = await fetch(`${API_BASE}/tts/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: cleaned }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`TTS failed (${res.status}): ${errText || "Unknown error"}`);
-    }
-
-    const blob = await res.blob();
-
-    if (!audioRef.current) return;
-
-    // Clean up any previous object URL
     if (audioObjectUrlRef.current) {
       URL.revokeObjectURL(audioObjectUrlRef.current);
       audioObjectUrlRef.current = null;
@@ -272,15 +417,12 @@ export default function PdfViewer({ fileUrl }) {
 
       try {
         audio.src = url;
-
         audio.addEventListener("ended", onEnded);
         audio.addEventListener("error", onError);
 
         const playPromise = audio.play();
         if (playPromise && typeof playPromise.catch === "function") {
-          playPromise.catch((e) => {
-            cleanup(() => reject(e));
-          });
+          playPromise.catch((e) => cleanup(() => reject(e)));
         }
       } catch (e) {
         cleanup(() => reject(e));
@@ -310,166 +452,215 @@ export default function PdfViewer({ fileUrl }) {
     } catch {}
   }
 
-  // Process text spans for TTS: collect ~5 paragraphs, clean once, and attach to the first span
-  async function processTextForTTS(spans) {
-    const startEl = spans?.[0]?.element;
-    if (!startEl) return spans || [];
+  async function buildChunkFromSpan(startSpan, chunkIndex, sessionId) {
+    let cursor = startSpan;
+    let chunks;
+    let nextSpan;
+    let combinedLength;
+    let chunkItems;
+    let accepted = false;
 
-    const chunks = collectTextChunks(startEl, 5);
-    const combinedText = chunks.map((c) => c.rawText).join("\n\n");
+    for (let attempt = 0; attempt < 8; attempt++) {
+      ({ chunks, nextSpan, combinedLength } = collectTextChunks(cursor));
+      if (chunks.length === 0) return null;
 
-    let cleanedText = combinedText;
-    try {
-      cleanedText = await sendToChatGPT(combinedText);
-    } catch {
-      cleanedText = combinedText;
-    }
+      chunkItems = chunks.flatMap((c) =>
+        c.spans.map((s) => ({ element: s.element, text: s.text }))
+      );
+      if (chunkItems.length === 0) return null;
 
-    // Flatten all spans included in these chunks into one big “read unit”
-    const allChunkSpans = chunks.flatMap((c) => c.spans);
+      const combinedText = sanitizeForTTS(chunks.map((c) => c.rawText).join("\n\n"));
+      const norm = normalizeForDedup(combinedText);
 
-    if (allChunkSpans.length === 0) return spans || [];
-
-    const processedSpans = [];
-
-    // First span carries the cleaned text and is what we actually speak
-    processedSpans.push({
-      ...allChunkSpans[0],
-      processedText: cleanedText,
-      readyForTTS: true,
-      isChunkStart: true,
-      chunkSize: allChunkSpans.length,
-      chunkIndex: 0,
-    });
-
-    // Rest are “continuations” that we visually highlight/skip
-    for (let i = 1; i < allChunkSpans.length; i++) {
-      processedSpans.push({
-        ...allChunkSpans[i],
-        processedText: "",
-        readyForTTS: false,
-        isChunkStart: false,
-        chunkSize: allChunkSpans.length,
-        chunkIndex: i,
-      });
-    }
-
-    return processedSpans;
-  }
-
-  async function loadMoreTextIntoBuffer() {
-    if (isLoadingMore.current) return;
-    isLoadingMore.current = true;
-
-    try {
-      const lastSpan = textBuffer.current[textBuffer.current.length - 1]?.element;
-      if (!lastSpan) return;
-
-      const nextSpan = getNextSpanGlobal(lastSpan);
-      if (!nextSpan) return;
-
-      const newSpans = getSpansFromPosition(nextSpan, bufferSize);
-      if (newSpans.length === 0) return;
-
-      const processedSpans = await processTextForTTS(newSpans);
-      textBuffer.current.push(...processedSpans);
-
-      if (textBuffer.current.length > bufferSize * 2) {
-        textBuffer.current = textBuffer.current.slice(-bufferSize);
+      if (norm.length >= 80 && isMostlyDuplicate(norm)) {
+        console.log(
+          `[Reading ${sessionId}] Chunk ${chunkIndex}: skipping duplicate text (${norm.length} chars), advancing cursor`
+        );
+        markSpansConsumed(chunkItems.map((item) => item.element));
+        markOverlappingSpansInDocument(norm);
+        cursor = nextSpan;
+        if (!cursor) return null;
+        continue;
       }
 
-      console.log(
-        `Loaded ${newSpans.length} more spans into buffer. Buffer size: ${textBuffer.current.length}`
-      );
-    } catch (error) {
-      console.error("Error loading more text:", error);
-    } finally {
-      isLoadingMore.current = false;
+      markSpansConsumed(chunkItems.map((item) => item.element));
+      markOverlappingSpansInDocument(norm);
+      recordSpokenFingerprint(norm);
+      accepted = true;
+      break;
     }
+
+    if (!accepted || !chunks?.length || !chunkItems?.length) {
+      console.warn(
+        `[Reading ${sessionId}] Chunk ${chunkIndex}: no new text after duplicate skips`
+      );
+      return null;
+    }
+
+    const combinedText = sanitizeForTTS(chunks.map((c) => c.rawText).join("\n\n"));
+    let cleanedText = combinedText;
+
+    const canUseGpt =
+      combinedText.length >= MIN_CHARS_FOR_GPT && !looksLikeHeadingOnly(combinedText);
+
+    if (canUseGpt) {
+      const gptResult = await sendToChatGPT(combinedText, { chunkIndex, sessionId });
+      if (gptResult) {
+        const maxAllowed = Math.max(
+          combinedText.length * MAX_GPT_EXPANSION_RATIO,
+          combinedText.length + 150
+        );
+        if (gptResult.length <= maxAllowed) {
+          cleanedText = sanitizeForTTS(gptResult);
+        } else {
+          console.warn(
+            `[Reading ${sessionId}] Chunk ${chunkIndex}: ChatGPT expanded ${combinedText.length} -> ${gptResult.length} chars; using raw PDF text`
+          );
+        }
+      } else {
+        console.warn(
+          `[Reading ${sessionId}] Chunk ${chunkIndex}: using raw PDF text (ChatGPT unavailable)`
+        );
+      }
+    } else {
+      console.log(
+        `[Reading ${sessionId}] Chunk ${chunkIndex}: skipping ChatGPT (${combinedLength} chars from PDF, heading-only or too short)`
+      );
+    }
+
+    if (!cleanedText) {
+      throw new Error("No speakable text after cleanup");
+    }
+
+    console.log(
+      `[Reading ${sessionId}] Chunk ${chunkIndex}: synthesizing ${cleanedText.length} chars`
+    );
+    const audioBlobs = await synthesizeSpeech(cleanedText);
+    if (!audioBlobs.length) {
+      throw new Error("TTS produced no audio");
+    }
+
+    return { audioBlobs, chunkItems, cleanedText, chunkIndex, nextSpan };
+  }
+
+  async function ensurePrefetch() {
+    if (prefetchPromise.current) {
+      return prefetchPromise.current;
+    }
+    if (!readCursorRef.current || !isReadingRef.current) {
+      return null;
+    }
+
+    const startSpan = readCursorRef.current;
+    const chunkIndex = chunkIndexRef.current;
+    const sessionId = readingSessionIdRef.current || "default";
+
+    prefetchPromise.current = (async () => {
+      try {
+        const chunk = await buildChunkFromSpan(startSpan, chunkIndex, sessionId);
+        if (chunk) {
+          readCursorRef.current = chunk.nextSpan;
+          chunkIndexRef.current += 1;
+          preparedQueue.current.push(chunk);
+          setReadingStatus(
+            `Chunk ${chunkIndex} ready · ${preparedQueue.current.length} in queue`
+          );
+          console.log(
+            `[Reading ${sessionId}] Chunk ${chunkIndex} ready (queue: ${preparedQueue.current.length})`
+          );
+        }
+        return chunk;
+      } catch (error) {
+        console.error(`[Reading ${sessionId}] Chunk ${chunkIndex} prepare failed:`, error);
+        const skip = collectTextChunks(startSpan, {
+          minChars: 80,
+          maxChars: 400,
+          maxParagraphs: 2,
+        });
+        if (skip.chunks?.length) {
+          markSpansConsumed(
+            skip.chunks.flatMap((c) => c.spans.map((s) => s.element))
+          );
+        }
+        readCursorRef.current = skip.nextSpan || getNextSpanGlobal(startSpan);
+        chunkIndexRef.current += 1;
+        return null;
+      } finally {
+        prefetchPromise.current = null;
+      }
+    })();
+
+    return prefetchPromise.current;
   }
 
   async function startReadingFromPosition(anchorSpan) {
     if (!anchorSpan) return;
 
+    readingSessionIdRef.current = `read-${Date.now()}`;
+    chunkIndexRef.current = 0;
+    readCursorRef.current = anchorSpan;
+    preparedQueue.current = [];
+    prefetchPromise.current = null;
+    spokenFingerprintsRef.current = [];
+    clearConsumedSpanMarks();
+
     setIsReading(true);
-    isReadingRef.current = true; // IMPORTANT: make the loop start immediately
+    isReadingRef.current = true;
     setCurrentReadingPosition(anchorSpan);
-    currentSpanIndex.current = 0;
 
-    const initialSpans = getSpansFromPosition(anchorSpan, bufferSize);
-    const processedSpans = await processTextForTTS(initialSpans);
-
-    textBuffer.current = processedSpans;
-    readingQueue.current = [...processedSpans];
-
-    console.log(`Started reading with ${initialSpans.length} spans in buffer`);
-
+    console.log(`[Reading ${readingSessionIdRef.current}] Started from selection`);
+    await ensurePrefetch();
     startReadingLoop();
   }
 
   async function startReadingLoop() {
-    console.log("reading queue", readingQueue.current.length);
-    console.log("isReading", isReadingRef.current);
+    const sessionId = readingSessionIdRef.current || "default";
 
-    while (isReadingRef.current && readingQueue.current.length > 0) {
-      if (readingQueue.current.length < bufferSize / 2 && !isLoadingMore.current) {
-        loadMoreTextIntoBuffer().then(() => {
-          const newSpans = textBuffer.current.slice(-bufferSize / 2);
-          readingQueue.current.push(...newSpans);
-        });
-      }
-
-      const currentSpan = readingQueue.current.shift();
-      if (!currentSpan) break;
-
-      if (!currentSpan.readyForTTS) continue;
-
-      highlightSpan(currentSpan.element);
-
-      try {
-        if (currentSpan.isChunkStart) {
-          // Pull the rest of this chunk off the queue now
-          const chunkItems = [currentSpan];
-          for (let i = 0; i < currentSpan.chunkSize - 1; i++) {
-            const next = readingQueue.current.shift();
-            if (!next) break;
-            chunkItems.push(next);
+    try {
+      while (isReadingRef.current) {
+        while (preparedQueue.current.length === 0 && isReadingRef.current) {
+          const chunk = await ensurePrefetch();
+          if (!chunk) {
+            break;
           }
-
-          // Highlight the whole chunk while audio plays
-          chunkItems.forEach(item => highlightSpan(item.element));
-
-          console.log("[Speaking chunk]", {
-            chunkSize: chunkItems.length,
-            chars: (currentSpan.processedText || "").length,
-            preview: (currentSpan.processedText || "").slice(0, 200),
-          });
-
-          await speakWithPiper(currentSpan.processedText);
-
-          // Remove highlights after playback ends
-          chunkItems.forEach(item => removeHighlight(item.element));
-        } else {
-          highlightSpan(currentSpan.element);
-          await speakWithPiper(currentSpan.text);
-          removeHighlight(currentSpan.element);
         }
 
-      } catch (e) {
-        console.error("TTS playback error:", e);
-        // If TTS fails, stop so you don't get stuck in an error loop
-        stopReading();
-        break;
-      } finally {
-        removeHighlight(currentSpan.element);
+        if (!isReadingRef.current || preparedQueue.current.length === 0) {
+          break;
+        }
+
+        const nextPrefetch = ensurePrefetch();
+        const { audioBlobs, chunkItems, chunkIndex } = preparedQueue.current.shift();
+
+        chunkItems.forEach((item) => highlightSpan(item.element));
+        setReadingStatus(
+          `Playing chunk ${chunkIndex} · ${preparedQueue.current.length} prepared ahead`
+        );
+        console.log(
+          `[Reading ${sessionId}] Playing chunk ${chunkIndex} (${audioBlobs.length} segment(s), ${chunkItems.length} spans)`
+        );
+
+        try {
+          for (let s = 0; s < audioBlobs.length && isReadingRef.current; s++) {
+            await playAudioBlob(audioBlobs[s]);
+          }
+        } catch (e) {
+          console.error(`[Reading ${sessionId}] Playback error on chunk ${chunkIndex}:`, e);
+        } finally {
+          chunkItems.forEach((item) => removeHighlight(item.element));
+        }
+
+        await nextPrefetch.catch(() => {});
       }
-
-      currentSpanIndex.current++;
+    } finally {
+      setIsReading(false);
+      isReadingRef.current = false;
+      preparedQueue.current = [];
+      prefetchPromise.current = null;
+      readCursorRef.current = null;
+      setReadingStatus("");
+      console.log(`[Reading ${sessionId}] Finished`);
     }
-
-    setIsReading(false);
-    isReadingRef.current = false;
-    console.log("Reading finished");
   }
 
  function highlightSpan(spanElement) {
@@ -484,12 +675,15 @@ function removeHighlight(spanElement) {
 
 
   function stopReading() {
-    // Make loop stop immediately
     isReadingRef.current = false;
     setIsReading(false);
 
-    readingQueue.current = [];
+    preparedQueue.current = [];
+    prefetchPromise.current = null;
+    readCursorRef.current = null;
+    spokenFingerprintsRef.current = [];
     stopAudioNow();
+    clearConsumedSpanMarks();
 
     document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
       removeHighlight(span);
@@ -633,10 +827,8 @@ function removeHighlight(spanElement) {
           {isReading ? "Stop Reading" : "Not Reading"}
         </button>
 
-        {isReading && (
-          <span style={{ marginLeft: "10px", color: "#666" }}>
-            Reading... Buffer: {textBuffer.current.length} spans
-          </span>
+        {isReading && readingStatus && (
+          <span style={{ marginLeft: "10px", color: "#666" }}>{readingStatus}</span>
         )}
       </div>
 
