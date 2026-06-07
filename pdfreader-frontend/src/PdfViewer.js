@@ -13,6 +13,101 @@ const API_BASE = (process.env.REACT_APP_API_BASE_URL || "http://localhost:8000/a
 );
 const hasDesktopTTS = typeof window !== "undefined" && !!window.desktopTTS?.speak;
 
+function IconSun() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+
+function IconMoon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <path d="M21 14.5A8.5 8.5 0 1 1 9.5 3 7 7 0 0 0 21 14.5z" />
+    </svg>
+  );
+}
+
+function IconSpeaker() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <path d="M11 5 6 9H3v6h3l5 4V5z" />
+      <path d="M15.5 8.5a5 5 0 0 1 0 7M17.8 6.3a8.5 8.5 0 0 1 0 11.4" />
+    </svg>
+  );
+}
+
+function IconStop() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <rect x="7" y="7" width="10" height="10" rx="1.5" />
+    </svg>
+  );
+}
+
+function IconChevronLeft() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <path d="m15 6-6 6 6 6" />
+    </svg>
+  );
+}
+
+function IconChevronRight() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <path d="m9 6 6 6-6 6" />
+    </svg>
+  );
+}
+
+function IconSidebar() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path d="M9 4v16" />
+    </svg>
+  );
+}
+
+function IconOpen() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <path d="M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4" />
+      <path d="M12 3v12M8 7l4-4 4 4" />
+    </svg>
+  );
+}
+
+function IconZoomOut() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M8 12h8" />
+    </svg>
+  );
+}
+
+function IconZoomIn() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 8v8M8 12h8" />
+    </svg>
+  );
+}
+
+const ZOOM_STEP = 0.1;
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 3;
+const LOADING_VIDEO = `${process.env.PUBLIC_URL || ""}/loading-animation.mp4`;
+const STILL_LOADING_VIDEO = `${process.env.PUBLIC_URL || ""}/still-loading-animation.mp4`;
+const LONG_LOADING_MS = 10000;
+const TOOLBAR_WIDTH = 56;
+const LOADER_GAP = 50;
+
 export default function PdfViewer({ fileUrl }) {
   const [numPages, setNumPages] = useState(null);
   const [isReading, setIsReading] = useState(false);
@@ -21,6 +116,10 @@ export default function PdfViewer({ fileUrl }) {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState(1);
   const [readingStatus, setReadingStatus] = useState("");
+  const [scale, setScale] = useState(1);
+  const [preparedCount, setPreparedCount] = useState(0);
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [showLongLoading, setShowLongLoading] = useState(false);
 
   const isReadingRef = useRef(isReading);
   const readCursorRef = useRef(null);
@@ -39,10 +138,44 @@ export default function PdfViewer({ fileUrl }) {
   const audioRef = useRef(null);
   const ttsAbortRef = useRef(null);
   const audioObjectUrlRef = useRef(null);
+  const pdfColumnRef = useRef(null);
+  const pdfContainerRef = useRef(null);
+  const needsInitialPageRef = useRef(true);
+  const loadingVideoRef = useRef(null);
+  const stillLoadingVideoRef = useRef(null);
+  const [floatUiPos, setFloatUiPos] = useState({
+    toolbarLeft: 0,
+    toolbarTop: 0,
+    loaderLeft: 0,
+    navLeft: 0,
+  });
 
-  function onDocumentLoadSuccess({ numPages }) {
-    setNumPages(numPages);
+  const showProcessingLoader = isReading && preparedCount === 0 && !isPlayingAudio;
+
+  function syncPreparedCount() {
+    setPreparedCount(preparedQueue.current.length);
   }
+
+  function onDocumentLoadSuccess({ numPages: totalPages }) {
+    setNumPages(totalPages);
+    setCurrentPage(1);
+    setPageInput(1);
+    needsInitialPageRef.current = true;
+    if (pdfContainerRef.current) {
+      pdfContainerRef.current.scrollTop = 0;
+    }
+    window.requestAnimationFrame(updateFloatUiPos);
+  }
+
+  useEffect(() => {
+    setNumPages(null);
+    setCurrentPage(1);
+    setPageInput(1);
+    needsInitialPageRef.current = true;
+    if (pdfContainerRef.current) {
+      pdfContainerRef.current.scrollTop = 0;
+    }
+  }, [fileUrl]);
 
   // Initialize a single Audio instance
   useEffect(() => {
@@ -562,6 +695,7 @@ export default function PdfViewer({ fileUrl }) {
           readCursorRef.current = chunk.nextSpan;
           chunkIndexRef.current += 1;
           preparedQueue.current.push(chunk);
+          syncPreparedCount();
           setReadingStatus(
             `Chunk ${chunkIndex} ready · ${preparedQueue.current.length} in queue`
           );
@@ -603,6 +737,8 @@ export default function PdfViewer({ fileUrl }) {
     prefetchPromise.current = null;
     spokenFingerprintsRef.current = [];
     clearConsumedSpanMarks();
+    setPreparedCount(0);
+    setIsPlayingAudio(false);
 
     setIsReading(true);
     isReadingRef.current = true;
@@ -631,6 +767,7 @@ export default function PdfViewer({ fileUrl }) {
 
         const nextPrefetch = ensurePrefetch();
         const { audioBlobs, chunkItems, chunkIndex } = preparedQueue.current.shift();
+        syncPreparedCount();
 
         chunkItems.forEach((item) => highlightSpan(item.element));
         setReadingStatus(
@@ -641,12 +778,14 @@ export default function PdfViewer({ fileUrl }) {
         );
 
         try {
+          setIsPlayingAudio(true);
           for (let s = 0; s < audioBlobs.length && isReadingRef.current; s++) {
             await playAudioBlob(audioBlobs[s]);
           }
         } catch (e) {
           console.error(`[Reading ${sessionId}] Playback error on chunk ${chunkIndex}:`, e);
         } finally {
+          setIsPlayingAudio(false);
           chunkItems.forEach((item) => removeHighlight(item.element));
         }
 
@@ -658,6 +797,8 @@ export default function PdfViewer({ fileUrl }) {
       preparedQueue.current = [];
       prefetchPromise.current = null;
       readCursorRef.current = null;
+      setPreparedCount(0);
+      setIsPlayingAudio(false);
       setReadingStatus("");
       console.log(`[Reading ${sessionId}] Finished`);
     }
@@ -682,6 +823,8 @@ function removeHighlight(spanElement) {
     prefetchPromise.current = null;
     readCursorRef.current = null;
     spokenFingerprintsRef.current = [];
+    setPreparedCount(0);
+    setIsPlayingAudio(false);
     stopAudioNow();
     clearConsumedSpanMarks();
 
@@ -725,8 +868,18 @@ function removeHighlight(spanElement) {
     document.documentElement.className = theme + "-mode";
   }, [theme]);
 
-  function onPageRender(pageNumber) {
-    setCurrentPage(pageNumber);
+  function handlePageRenderSuccess(pageNumber) {
+    updateFloatUiPos();
+
+    if (pageNumber === 1 && needsInitialPageRef.current) {
+      needsInitialPageRef.current = false;
+      window.requestAnimationFrame(() => {
+        goToPage(1);
+        if (pdfContainerRef.current) {
+          pdfContainerRef.current.scrollTop = 0;
+        }
+      });
+    }
   }
 
   function handleScroll(e) {
@@ -745,20 +898,111 @@ function removeHighlight(spanElement) {
     }
 
     if (!found && pages.length > 0) {
-      setCurrentPage(pages.length);
+      const atBottom =
+        container.scrollTop + container.clientHeight >= container.scrollHeight - 4;
+      if (atBottom) {
+        setCurrentPage(pages.length);
+      }
     }
   }
 
+  function updateFloatUiPos() {
+    const column = pdfColumnRef.current;
+    if (!column) return;
+
+    const rect = column.getBoundingClientRect();
+    const toolbarGap = 14;
+    const toolbarLeft = Math.min(
+      rect.right + toolbarGap,
+      window.innerWidth - TOOLBAR_WIDTH - 12
+    );
+    const resolvedToolbarLeft = Math.max(toolbarLeft, rect.right + 4);
+
+    setFloatUiPos({
+      toolbarLeft: resolvedToolbarLeft,
+      toolbarTop: window.innerHeight / 2,
+      loaderLeft: resolvedToolbarLeft + TOOLBAR_WIDTH + LOADER_GAP,
+      navLeft: rect.left + rect.width / 2,
+    });
+  }
+
   useEffect(() => {
-    const container = document.querySelector(".pdf-container");
-    if (container) {
-      container.addEventListener("scroll", handleScroll);
-      return () => container.removeEventListener("scroll", handleScroll);
+    if (!showProcessingLoader) {
+      setShowLongLoading(false);
+      return undefined;
     }
-  }, [numPages]);
+
+    const timer = window.setTimeout(() => {
+      setShowLongLoading(true);
+    }, LONG_LOADING_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [showProcessingLoader]);
+
+  useEffect(() => {
+    const primary = loadingVideoRef.current;
+    const still = stillLoadingVideoRef.current;
+
+    if (!showProcessingLoader) {
+      primary?.pause();
+      still?.pause();
+      if (primary) primary.currentTime = 0;
+      if (still) still.currentTime = 0;
+      return;
+    }
+
+    if (showLongLoading) {
+      primary?.pause();
+      still?.play()?.catch(() => {});
+    } else {
+      still?.pause();
+      primary?.play()?.catch(() => {});
+    }
+  }, [showProcessingLoader, showLongLoading]);
+
+  useEffect(() => {
+    const container = pdfContainerRef.current;
+    if (!container) return undefined;
+
+    const onScroll = (e) => {
+      handleScroll(e);
+      updateFloatUiPos();
+    };
+
+    container.addEventListener("scroll", onScroll);
+    window.addEventListener("resize", updateFloatUiPos);
+
+    const observer =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(updateFloatUiPos)
+        : null;
+    if (observer && pdfColumnRef.current) {
+      observer.observe(pdfColumnRef.current);
+    }
+
+    updateFloatUiPos();
+
+    return () => {
+      container.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", updateFloatUiPos);
+      observer?.disconnect();
+    };
+  }, [numPages, scale]);
+
+  useEffect(() => {
+    updateFloatUiPos();
+  }, [scale]);
+
+  function zoomIn() {
+    setScale((s) => Math.min(MAX_ZOOM, Math.round((s + ZOOM_STEP) * 10) / 10));
+  }
+
+  function zoomOut() {
+    setScale((s) => Math.max(MIN_ZOOM, Math.round((s - ZOOM_STEP) * 10) / 10));
+  }
 
   function goToPage(pageNum) {
-    const container = document.querySelector(".pdf-container");
+    const container = pdfContainerRef.current;
     const pages = container?.querySelectorAll(".react-pdf__Page");
     if (pages && pages.length > 0 && pageNum >= 1 && pageNum <= pages.length) {
       const pageElem = pages[pageNum - 1];
@@ -786,9 +1030,24 @@ function removeHighlight(spanElement) {
     }
   }
 
-  return  (
-    <div className={theme === "dark" ? "dark-mode" : "light-mode"}>
+  function goToPrevPage() {
+    if (currentPage > 1) {
+      goToPage(currentPage - 1);
+    }
+  }
 
+  function goToNextPage() {
+    if (numPages && currentPage < numPages) {
+      goToPage(currentPage + 1);
+    }
+  }
+
+  const readingTitle = isReading
+    ? readingStatus || "Stop reading"
+    : "Select text in the PDF to start reading";
+
+  return (
+    <div className={`pdf-viewer-root ${theme === "dark" ? "dark-mode" : "light-mode"}`}>
       <style>{`
         .tts-highlight {
           background: yellow !important;
@@ -796,93 +1055,170 @@ function removeHighlight(spanElement) {
         }
       `}</style>
 
-      <div style={{ marginBottom: "10px" }}>
-        <button
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+      <div className="pdf-stage">
+        <div className="pdf-container" ref={pdfContainerRef}>
+          <div className="pdf-column" ref={pdfColumnRef}>
+            <Document file={fileUrl} key={fileUrl} onLoadSuccess={onDocumentLoadSuccess}>
+              {Array.from(new Array(numPages), (el, index) => (
+                <Page
+                  key={`page_${index + 1}`}
+                  pageNumber={index + 1}
+                  scale={scale}
+                  renderAnnotationLayer={false}
+                  onRenderSuccess={() => handlePageRenderSuccess(index + 1)}
+                />
+              ))}
+            </Document>
+          </div>
+        </div>
+
+        <aside
+          className="pdf-float-toolbar"
+          role="toolbar"
+          aria-label="PDF controls"
           style={{
-            padding: "8px 16px",
-            backgroundColor: theme === "dark" ? "#333" : "#eee",
-            color: theme === "dark" ? "#fff" : "#222",
-            border: "none",
-            borderRadius: "4px",
-            marginRight: "10px",
-            cursor: "pointer",
+            left: floatUiPos.toolbarLeft,
+            top: floatUiPos.toolbarTop,
+            visibility: floatUiPos.navLeft > 0 ? "visible" : "hidden",
           }}
         >
-          Switch to {theme === "dark" ? "Light" : "Dark"} Mode
-        </button>
-
-        <button
-          onClick={stopReading}
-          disabled={!isReading}
-          style={{
-            padding: "8px 16px",
-            backgroundColor: isReading ? "#ff4444" : "#ccc",
-            color: "white",
-            border: "none",
-            borderRadius: "4px",
-            cursor: isReading ? "pointer" : "not-allowed",
-          }}
-        >
-          {isReading ? "Stop Reading" : "Not Reading"}
-        </button>
-
-        {isReading && readingStatus && (
-          <span style={{ marginLeft: "10px", color: "#666" }}>{readingStatus}</span>
-        )}
-      </div>
-
-      <div className="pdf-container">
-        <form className="page-overlay" onSubmit={handleGo}>
-          <label htmlFor="page-input" style={{ marginRight: 8 }}>
-            Page
-          </label>
-          <input
-            id="page-input"
-            type="number"
-            min={1}
-            max={numPages || 1}
-            value={pageInput}
-            onChange={handleInputChange}
-            style={{
-              width: 60,
-              padding: "4px 8px",
-              borderRadius: 8,
-              border: "1px solid #888",
-              marginRight: 8,
-              fontSize: "1rem",
-              textAlign: "center",
-              background: "rgba(255,255,255,0.9)",
-            }}
-          />
-          <span style={{ marginRight: 8 }}>/ {numPages || 1}</span>
-          <button
-            type="submit"
-            style={{
-              padding: "4px 12px",
-              borderRadius: 8,
-              border: "none",
-              background: "#444",
-              color: "#fff",
-              fontWeight: "bold",
-              cursor: "pointer",
-              fontSize: "1rem",
-            }}
-          >
-            Go
+          <button type="button" className="pdf-float-btn pdf-float-btn--stub" title="Sidebar" aria-label="Sidebar">
+            <IconSidebar />
           </button>
-        </form>
+          <button type="button" className="pdf-float-btn pdf-float-btn--stub" title="Open" aria-label="Open">
+            <IconOpen />
+          </button>
 
-        <Document file={fileUrl} onLoadSuccess={onDocumentLoadSuccess}>
-          {Array.from(new Array(numPages), (el, index) => (
-            <Page
-              key={`page_${index + 1}`}
-              pageNumber={index + 1}
-              renderAnnotationLayer={false}
-              onRenderSuccess={() => onPageRender(index + 1)}
+          <div className="pdf-float-divider" aria-hidden />
+
+          <form className="pdf-toolbar-page" onSubmit={handleGo}>
+            <input
+              id="page-input"
+              className="pdf-page-input"
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={pageInput}
+              onChange={handleInputChange}
+              aria-label="Current page"
             />
-          ))}
-        </Document>
+            <span className="pdf-page-total">/ {numPages || "—"}</span>
+          </form>
+
+          <div className="pdf-float-divider" aria-hidden />
+
+          <button
+            type="button"
+            className="pdf-float-btn"
+            onClick={zoomOut}
+            disabled={scale <= MIN_ZOOM}
+            title="Zoom out"
+            aria-label="Zoom out"
+          >
+            <IconZoomOut />
+          </button>
+          <span className="pdf-toolbar-zoom-label">{Math.round(scale * 100)}%</span>
+          <button
+            type="button"
+            className="pdf-float-btn"
+            onClick={zoomIn}
+            disabled={scale >= MAX_ZOOM}
+            title="Zoom in"
+            aria-label="Zoom in"
+          >
+            <IconZoomIn />
+          </button>
+          <button type="button" className="pdf-float-text-btn pdf-float-btn--stub" title="Fit width" aria-label="Fit width">
+            Fit width
+          </button>
+
+          <div className="pdf-float-divider" aria-hidden />
+
+          <button
+            type="button"
+            className="pdf-float-btn"
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          >
+            {theme === "dark" ? <IconSun /> : <IconMoon />}
+          </button>
+          <button
+            type="button"
+            className={`pdf-float-btn${isReading ? " pdf-float-btn--active" : ""}`}
+            onClick={isReading ? stopReading : undefined}
+            disabled={!isReading}
+            title={readingTitle}
+            aria-label={readingTitle}
+          >
+            {isReading ? <IconStop /> : <IconSpeaker />}
+          </button>
+        </aside>
+
+        {showProcessingLoader && (
+          <div
+            className="pdf-processing-loader pdf-processing-loader--visible"
+            style={{
+              left: floatUiPos.loaderLeft,
+              top: floatUiPos.toolbarTop,
+              visibility: floatUiPos.navLeft > 0 ? "visible" : "hidden",
+            }}
+            aria-hidden={!showProcessingLoader}
+          >
+            <div className="pdf-processing-loader-inner">
+              <video
+                ref={loadingVideoRef}
+                className={`pdf-processing-loader-video${
+                  showLongLoading ? " pdf-processing-loader-video--faded" : ""
+                }`}
+                src={LOADING_VIDEO}
+                muted
+                loop
+                playsInline
+                preload="auto"
+              />
+              <video
+                ref={stillLoadingVideoRef}
+                className={`pdf-processing-loader-video pdf-processing-loader-video--overlay${
+                  showLongLoading ? " pdf-processing-loader-video--overlay-visible" : ""
+                }`}
+                src={STILL_LOADING_VIDEO}
+                muted
+                loop
+                playsInline
+                preload="auto"
+              />
+            </div>
+          </div>
+        )}
+
+        <nav
+          className="pdf-page-nav"
+          aria-label="Page navigation"
+          style={{
+            left: floatUiPos.navLeft,
+            visibility: floatUiPos.navLeft > 0 ? "visible" : "hidden",
+          }}
+        >
+          <button
+            type="button"
+            className="pdf-page-nav-btn"
+            onClick={goToPrevPage}
+            disabled={currentPage <= 1}
+            aria-label="Previous page"
+          >
+            <IconChevronLeft />
+          </button>
+          <button
+            type="button"
+            className="pdf-page-nav-btn"
+            onClick={goToNextPage}
+            disabled={!numPages || currentPage >= numPages}
+            aria-label="Next page"
+          >
+            <IconChevronRight />
+          </button>
+        </nav>
       </div>
     </div>
   );
