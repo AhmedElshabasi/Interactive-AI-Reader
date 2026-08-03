@@ -3,6 +3,7 @@ import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import { sanitizeForTTS, splitTextForTTS } from "./ttsSanitize";
+import { listBooks, updateBookPage } from "./libraryStore";
 
 // Set workerSrc for pdfjs (explicit https for production / strict CSP)
 pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.mjs`;
@@ -104,22 +105,36 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const LOADING_VIDEO = `${process.env.PUBLIC_URL || ""}/loading-animation.mp4`;
 const STILL_LOADING_VIDEO = `${process.env.PUBLIC_URL || ""}/still-loading-animation.mp4`;
+const READING_ARROW_VIDEO = `${process.env.PUBLIC_URL || ""}/arrow.webm`;
 const LONG_LOADING_MS = 10000;
+const READING_ARROW_SIZE = 44;
+const READING_ARROW_GAP = 8;
 const TOOLBAR_WIDTH = 56;
 const LOADER_GAP = 50;
 
-export default function PdfViewer({ fileUrl }) {
+export default function PdfViewer({
+  fileUrl,
+  bookId = null,
+  bookName = "",
+  initialPage = 1,
+  onImportFile,
+  onSelectBook,
+}) {
   const [numPages, setNumPages] = useState(null);
   const [isReading, setIsReading] = useState(false);
   const [, setCurrentReadingPosition] = useState(null);
   const [theme, setTheme] = useState("dark");
-  const [currentPage, setCurrentPage] = useState(1);
-  const [pageInput, setPageInput] = useState(1);
+  const [currentPage, setCurrentPage] = useState(Math.max(1, initialPage || 1));
+  const [pageInput, setPageInput] = useState(Math.max(1, initialPage || 1));
   const [readingStatus, setReadingStatus] = useState("");
   const [scale, setScale] = useState(1);
   const [preparedCount, setPreparedCount] = useState(0);
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [showLongLoading, setShowLongLoading] = useState(false);
+  const [readingArrowPos, setReadingArrowPos] = useState(null);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryBooks, setLibraryBooks] = useState([]);
+  const [libraryBusy, setLibraryBusy] = useState(false);
 
   const isReadingRef = useRef(isReading);
   const readCursorRef = useRef(null);
@@ -143,6 +158,13 @@ export default function PdfViewer({ fileUrl }) {
   const needsInitialPageRef = useRef(true);
   const loadingVideoRef = useRef(null);
   const stillLoadingVideoRef = useRef(null);
+  const activeReadingSpanRef = useRef(null);
+  const readingArrowVideoRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const initialPageRef = useRef(Math.max(1, initialPage || 1));
+  const pagePersistTimerRef = useRef(null);
+  const currentPageRef = useRef(Math.max(1, initialPage || 1));
+  const pageRestoreDoneRef = useRef(false);
   const [floatUiPos, setFloatUiPos] = useState({
     toolbarLeft: 0,
     toolbarTop: 0,
@@ -158,24 +180,104 @@ export default function PdfViewer({ fileUrl }) {
 
   function onDocumentLoadSuccess({ numPages: totalPages }) {
     setNumPages(totalPages);
-    setCurrentPage(1);
-    setPageInput(1);
+    const target = Math.min(Math.max(1, initialPageRef.current || 1), totalPages || 1);
+    setCurrentPage(target);
+    setPageInput(target);
+    currentPageRef.current = target;
     needsInitialPageRef.current = true;
-    if (pdfContainerRef.current) {
-      pdfContainerRef.current.scrollTop = 0;
-    }
+    pageRestoreDoneRef.current = false;
     window.requestAnimationFrame(updateFloatUiPos);
   }
 
   useEffect(() => {
+    initialPageRef.current = Math.max(1, initialPage || 1);
     setNumPages(null);
-    setCurrentPage(1);
-    setPageInput(1);
+    setCurrentPage(initialPageRef.current);
+    setPageInput(initialPageRef.current);
+    currentPageRef.current = initialPageRef.current;
     needsInitialPageRef.current = true;
-    if (pdfContainerRef.current) {
-      pdfContainerRef.current.scrollTop = 0;
+    pageRestoreDoneRef.current = false;
+  }, [fileUrl, initialPage]);
+
+  useEffect(() => {
+    if (!numPages) return undefined;
+    const target = Math.min(Math.max(1, initialPageRef.current || 1), numPages);
+
+    const timer = window.setTimeout(() => {
+      goToPage(target);
+      needsInitialPageRef.current = false;
+      pageRestoreDoneRef.current = true;
+      updateFloatUiPos();
+    }, 80);
+
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- restore once pages exist for this file
+  }, [numPages, fileUrl]);
+
+  useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
+
+  function persistPage(page) {
+    if (!pageRestoreDoneRef.current || !page || page < 1) return;
+
+    if (pagePersistTimerRef.current) {
+      window.clearTimeout(pagePersistTimerRef.current);
     }
-  }, [fileUrl]);
+
+    pagePersistTimerRef.current = window.setTimeout(async () => {
+      try {
+        if (bookId) {
+          await updateBookPage(bookId, page);
+        } else if (fileUrl) {
+          localStorage.setItem(`pdf-last-page:${fileUrl}`, String(page));
+        }
+      } catch (err) {
+        console.warn("Failed to save page progress:", err);
+      }
+    }, 400);
+  }
+
+  useEffect(() => {
+    persistPage(currentPage);
+    return () => {
+      if (pagePersistTimerRef.current) {
+        window.clearTimeout(pagePersistTimerRef.current);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- persist when page/book changes
+  }, [currentPage, bookId, fileUrl]);
+
+  async function refreshLibrary() {
+    setLibraryBusy(true);
+    try {
+      const books = await listBooks();
+      setLibraryBooks(books);
+    } catch (err) {
+      console.error("Failed to list books:", err);
+      setLibraryBooks([]);
+    } finally {
+      setLibraryBusy(false);
+    }
+  }
+
+  async function toggleLibrary() {
+    const next = !libraryOpen;
+    setLibraryOpen(next);
+    if (next) await refreshLibrary();
+  }
+
+  function openFilePicker() {
+    fileInputRef.current?.click();
+  }
+
+  function handleFileInputChange(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file && onImportFile) {
+      onImportFile(file);
+    }
+  }
 
   // Initialize a single Audio instance
   useEffect(() => {
@@ -769,7 +871,6 @@ export default function PdfViewer({ fileUrl }) {
         const { audioBlobs, chunkItems, chunkIndex } = preparedQueue.current.shift();
         syncPreparedCount();
 
-        chunkItems.forEach((item) => highlightSpan(item.element));
         setReadingStatus(
           `Playing chunk ${chunkIndex} · ${preparedQueue.current.length} prepared ahead`
         );
@@ -780,13 +881,15 @@ export default function PdfViewer({ fileUrl }) {
         try {
           setIsPlayingAudio(true);
           for (let s = 0; s < audioBlobs.length && isReadingRef.current; s++) {
+            const spanForSegment = getSpanForAudioSegment(chunkItems, s, audioBlobs.length);
+            setReadingArrowTarget(spanForSegment);
             await playAudioBlob(audioBlobs[s]);
           }
         } catch (e) {
           console.error(`[Reading ${sessionId}] Playback error on chunk ${chunkIndex}:`, e);
         } finally {
           setIsPlayingAudio(false);
-          chunkItems.forEach((item) => removeHighlight(item.element));
+          clearReadingArrow();
         }
 
         await nextPrefetch.catch(() => {});
@@ -799,21 +902,49 @@ export default function PdfViewer({ fileUrl }) {
       readCursorRef.current = null;
       setPreparedCount(0);
       setIsPlayingAudio(false);
+      clearReadingArrow();
       setReadingStatus("");
       console.log(`[Reading ${sessionId}] Finished`);
     }
   }
 
- function highlightSpan(spanElement) {
-  if (!spanElement) return;
-  spanElement.classList.add("tts-highlight");
-}
+  function getSpanForAudioSegment(chunkItems, segmentIndex, totalSegments) {
+    if (!chunkItems?.length) return null;
+    if (totalSegments <= 1) return chunkItems[0].element;
+    const spanIndex = Math.min(
+      Math.floor((segmentIndex / totalSegments) * chunkItems.length),
+      chunkItems.length - 1
+    );
+    return chunkItems[spanIndex].element;
+  }
 
-function removeHighlight(spanElement) {
-  if (!spanElement) return;
-  spanElement.classList.remove("tts-highlight");
-}
+  function updateReadingArrowPosition(spanElement) {
+    if (!spanElement) {
+      setReadingArrowPos(null);
+      return;
+    }
 
+    const rect = spanElement.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      setReadingArrowPos(null);
+      return;
+    }
+
+    setReadingArrowPos({
+      top: rect.top + rect.height / 2,
+      left: Math.max(8, rect.left - READING_ARROW_SIZE - READING_ARROW_GAP),
+    });
+  }
+
+  function setReadingArrowTarget(spanElement) {
+    activeReadingSpanRef.current = spanElement || null;
+    updateReadingArrowPosition(spanElement);
+  }
+
+  function clearReadingArrow() {
+    activeReadingSpanRef.current = null;
+    setReadingArrowPos(null);
+  }
 
   function stopReading() {
     isReadingRef.current = false;
@@ -827,10 +958,7 @@ function removeHighlight(spanElement) {
     setIsPlayingAudio(false);
     stopAudioNow();
     clearConsumedSpanMarks();
-
-    document.querySelectorAll(".react-pdf__Page__textContent span").forEach((span) => {
-      removeHighlight(span);
-    });
+    clearReadingArrow();
   }
 
   useEffect(() => {
@@ -871,13 +999,11 @@ function removeHighlight(spanElement) {
   function handlePageRenderSuccess(pageNumber) {
     updateFloatUiPos();
 
-    if (pageNumber === 1 && needsInitialPageRef.current) {
+    if (needsInitialPageRef.current && pageNumber === initialPageRef.current) {
       needsInitialPageRef.current = false;
       window.requestAnimationFrame(() => {
-        goToPage(1);
-        if (pdfContainerRef.current) {
-          pdfContainerRef.current.scrollTop = 0;
-        }
+        goToPage(initialPageRef.current);
+        pageRestoreDoneRef.current = true;
       });
     }
   }
@@ -967,10 +1093,15 @@ function removeHighlight(spanElement) {
     const onScroll = (e) => {
       handleScroll(e);
       updateFloatUiPos();
+      updateReadingArrowPosition(activeReadingSpanRef.current);
     };
 
     container.addEventListener("scroll", onScroll);
-    window.addEventListener("resize", updateFloatUiPos);
+    const onResize = () => {
+      updateFloatUiPos();
+      updateReadingArrowPosition(activeReadingSpanRef.current);
+    };
+    window.addEventListener("resize", onResize);
 
     const observer =
       typeof ResizeObserver !== "undefined"
@@ -984,14 +1115,27 @@ function removeHighlight(spanElement) {
 
     return () => {
       container.removeEventListener("scroll", onScroll);
-      window.removeEventListener("resize", updateFloatUiPos);
+      window.removeEventListener("resize", onResize);
       observer?.disconnect();
     };
   }, [numPages, scale]);
 
   useEffect(() => {
     updateFloatUiPos();
+    updateReadingArrowPosition(activeReadingSpanRef.current);
   }, [scale]);
+
+  useEffect(() => {
+    const video = readingArrowVideoRef.current;
+    if (!video) return;
+
+    if (readingArrowPos) {
+      video.play()?.catch(() => {});
+    } else {
+      video.pause();
+      video.currentTime = 0;
+    }
+  }, [readingArrowPos]);
 
   function zoomIn() {
     setScale((s) => Math.min(MAX_ZOOM, Math.round((s + ZOOM_STEP) * 10) / 10));
@@ -1048,13 +1192,6 @@ function removeHighlight(spanElement) {
 
   return (
     <div className={`pdf-viewer-root ${theme === "dark" ? "dark-mode" : "light-mode"}`}>
-      <style>{`
-        .tts-highlight {
-          background: yellow !important;
-          color: black !important;
-        }
-      `}</style>
-
       <div className="pdf-stage">
         <div className="pdf-container" ref={pdfContainerRef}>
           <div className="pdf-column" ref={pdfColumnRef}>
@@ -1082,12 +1219,32 @@ function removeHighlight(spanElement) {
             visibility: floatUiPos.navLeft > 0 ? "visible" : "hidden",
           }}
         >
-          <button type="button" className="pdf-float-btn pdf-float-btn--stub" title="Sidebar" aria-label="Sidebar">
+          <button
+            type="button"
+            className={`pdf-float-btn${libraryOpen ? " pdf-float-btn--selected" : ""}`}
+            onClick={toggleLibrary}
+            title="Library"
+            aria-label="Library"
+            aria-expanded={libraryOpen}
+          >
             <IconSidebar />
           </button>
-          <button type="button" className="pdf-float-btn pdf-float-btn--stub" title="Open" aria-label="Open">
+          <button
+            type="button"
+            className="pdf-float-btn"
+            onClick={openFilePicker}
+            title="Open PDF"
+            aria-label="Open PDF"
+          >
             <IconOpen />
           </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            className="pdf-file-input"
+            onChange={handleFileInputChange}
+          />
 
           <div className="pdf-float-divider" aria-hidden />
 
@@ -1154,6 +1311,77 @@ function removeHighlight(spanElement) {
             {isReading ? <IconStop /> : <IconSpeaker />}
           </button>
         </aside>
+
+        {libraryOpen && (
+          <div
+            className="pdf-library-panel"
+            style={{
+              left: floatUiPos.toolbarLeft + TOOLBAR_WIDTH + 12,
+              top: floatUiPos.toolbarTop,
+              visibility: floatUiPos.navLeft > 0 ? "visible" : "hidden",
+            }}
+          >
+            <div className="pdf-library-header">
+              <span>Library</span>
+              <button
+                type="button"
+                className="pdf-library-close"
+                onClick={() => setLibraryOpen(false)}
+                aria-label="Close library"
+              >
+                ×
+              </button>
+            </div>
+            {bookName && <div className="pdf-library-current">Now: {bookName}</div>}
+            <button type="button" className="pdf-library-import" onClick={openFilePicker}>
+              Import PDF…
+            </button>
+            <div className="pdf-library-list">
+              {libraryBusy && <div className="pdf-library-empty">Loading…</div>}
+              {!libraryBusy && libraryBooks.length === 0 && (
+                <div className="pdf-library-empty">No imported books yet</div>
+              )}
+              {!libraryBusy &&
+                libraryBooks.map((book) => (
+                  <button
+                    key={book.id}
+                    type="button"
+                    className={`pdf-library-item${book.id === bookId ? " pdf-library-item--active" : ""}`}
+                    onClick={() => {
+                      if (book.id !== bookId && onSelectBook) {
+                        onSelectBook(book);
+                      }
+                      setLibraryOpen(false);
+                    }}
+                  >
+                    <span className="pdf-library-item-name">{book.name}</span>
+                    <span className="pdf-library-item-meta">p. {book.lastPage || 1}</span>
+                  </button>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {readingArrowPos && (
+          <div
+            className="pdf-reading-arrow pdf-reading-arrow--visible"
+            style={{
+              top: readingArrowPos.top,
+              left: readingArrowPos.left,
+            }}
+            aria-hidden
+          >
+            <video
+              ref={readingArrowVideoRef}
+              className="pdf-reading-arrow-video"
+              src={READING_ARROW_VIDEO}
+              muted
+              loop
+              playsInline
+              preload="auto"
+            />
+          </div>
+        )}
 
         {showProcessingLoader && (
           <div
